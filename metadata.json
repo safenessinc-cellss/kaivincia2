@@ -1,0 +1,6 @@
+{
+  "name": "Kaivincia Corp CRM",
+  "description": "Kaivincia - El ecosistema inteligente para agencias de élite, CRM, telefonía VoIP y cobranza.",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

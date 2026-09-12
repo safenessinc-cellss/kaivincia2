@@ -1,0 +1,3930 @@
+import { useState, useEffect, useRef, useMemo } from 'react';
+import { useOutletContext, useNavigate, useSearchParams } from 'react-router-dom';
+import { doc, onSnapshot, setDoc, collection, updateDoc, addDoc } from 'firebase/firestore';
+import { db, auth, handleFirestoreError, OperationType } from '../firebase';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import CallInterventionModal from '../components/voip/CallInterventionModal';
+import CallDispositionModal from '../components/voip/CallDispositionModal';
+import { CallDisposition } from '../types/crm';
+import { useLanguage } from '../contexts/LanguageContext';
+import { 
+  Settings, Phone, Save, X, CheckCircle2, AlertCircle, Plus, Edit2,
+  Link as LinkIcon, GripVertical, Activity, Lock, Eye, EyeOff, PlayCircle,
+  ChevronUp, ChevronDown, MessageSquare, Mic, User, Send, ListTodo, Search,
+  BrainCircuit, Zap, Sparkles, Filter, MoreVertical, PhoneIncoming, PhoneOutgoing,
+  MessageCircle, BarChart2, TrendingUp, ShieldCheck, Clock, Terminal,
+  MapPin, Smartphone, FileText, Download, AlertTriangle, Mail, Instagram, ExternalLink,
+  Cpu, Globe, Wifi, QrCode, RefreshCw, Headphones, Ear, PhoneOff, Radio, Calendar
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line } from 'recharts';
+
+interface DynamicLink {
+  id: string;
+  label: string;
+  url: string;
+}
+
+interface Provider {
+  id: string;
+  name: string;
+  status: 'Activo' | 'Inactivo';
+  costPerMinute: string;
+  lastUpdated: string;
+  type: 'api' | 'iframe';
+  accountId?: string;
+  apiKey?: string;
+  iframeUrl?: string;
+  isDefault: boolean;
+  dynamicLinks?: DynamicLink[];
+  qualityTrend?: number[]; // Percentage quality for sparkline
+}
+
+const INITIAL_PROVIDERS: Provider[] = [
+  {
+    id: 'zadarma',
+    name: 'Zadarma (Plataforma Actual)',
+    status: 'Activo',
+    costPerMinute: '$0.012',
+    lastUpdated: new Date().toISOString(),
+    type: 'api',
+    accountId: 'jdjd.sanchez@gmail.com',
+    apiKey: 'RCmt1800**',
+    iframeUrl: 'https://my.zadarma.com/mypbx/',
+    isDefault: true,
+    dynamicLinks: [
+      { id: 'z1', label: 'Mi PBX Zadarma', url: 'https://my.zadarma.com/mypbx/' },
+      { id: 'z2', label: 'Configuración SIP', url: 'https://my.zadarma.com/mysip/' }
+    ],
+    qualityTrend: [98, 97, 99, 98, 99, 99, 98]
+  },
+  {
+    id: 'zoho_voice',
+    name: 'Zoho Voice',
+    status: 'Inactivo',
+    costPerMinute: '$0.018',
+    lastUpdated: new Date().toISOString(),
+    type: 'iframe',
+    accountId: 'zaydeli.delarosa@kaivinciacorp.com',
+    apiKey: 'Kaivinciacorp1234.!',
+    iframeUrl: 'https://voice.zoho.com/',
+    isDefault: false,
+    dynamicLinks: [
+      { id: 'zo1', label: 'Admin Zoho Voice', url: 'https://voice.zoho.com/admin' }
+    ],
+    qualityTrend: [85, 87, 88, 84, 86, 85, 87]
+  },
+  {
+    id: 'twilio',
+    name: 'Twilio API',
+    status: 'Inactivo',
+    costPerMinute: '$0.015',
+    lastUpdated: new Date().toISOString(),
+    type: 'api',
+    accountId: 'zaydeli.delarosa@kaivinciacorp.com',
+    apiKey: 'Samythob0829.!',
+    isDefault: false,
+    dynamicLinks: [
+      { id: 'tw1', label: 'Twilio Console', url: 'https://console.twilio.com/' }
+    ],
+    qualityTrend: [95, 96, 94, 95, 96, 95, 97]
+  },
+  {
+    id: 'phoneiq',
+    name: 'PhoneIQ (3 Licencias)',
+    status: 'Inactivo',
+    costPerMinute: '$0.022',
+    lastUpdated: new Date().toISOString(),
+    type: 'api',
+    accountId: 'zaydeli.delarosa@kaivinciacorp.com',
+    apiKey: 'Samythob0829.!',
+    isDefault: false,
+    dynamicLinks: [
+      { id: 'pi1', label: 'PhoneIQ Portal', url: 'https://admin.phoneiq.co/' }
+    ],
+    qualityTrend: [75, 78, 74, 76, 72, 70, 71]
+  }
+];
+
+interface ChatMessage {
+  id: string;
+  sender: string;
+  role: 'agent' | 'customer';
+  text: string;
+  timestamp: string;
+  sentiment?: 'positive' | 'neutral' | 'negative';
+}
+
+export default function CallSystem() {
+  const { userData } = useOutletContext<{ userData: any }>();
+  const { t } = useLanguage();
+  const navigate = useNavigate();
+  const [providers, setProviders] = useState<Provider[]>(INITIAL_PROVIDERS);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [routingRule, setRoutingRule] = useState('cost');
+  const [activeTab, setActiveTab] = useState('monitor');
+  const [showSecrets, setShowSecrets] = useState(false);
+  const [authPrompt, setAuthPrompt] = useState(false);
+  const [authPassword, setAuthPassword] = useState('');
+  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(auth.currentUser);
+
+  useEffect(() => {
+    const unsubAuth = onAuthStateChanged(auth, (u) => {
+      setCurrentUser(u);
+    });
+    return () => unsubAuth();
+  }, []);
+  
+  // eSIM Integration States
+  const [esimProfiles, setEsimProfiles] = useState<any[]>([]);
+  const [selectedEsimId, setSelectedEsimId] = useState<string | null>(null);
+  const [showEsimProvisionForm, setShowEsimProvisionForm] = useState(false);
+  const [newEsimRegion, setNewEsimRegion] = useState('USA');
+  const [newEsimPackage, setNewEsimPackage] = useState('10');
+  const [newEsimAgent, setNewEsimAgent] = useState('');
+  const [simulatingEsimUsageId, setSimulatingEsimUsageId] = useState<string | null>(null);
+  
+  // New States for evolved features
+  const [searchParams] = useSearchParams();
+  const [activeCall, setActiveCall] = useState<any | null>({
+    id: 'call_99',
+    customer: 'Juan Pérez (LTV: $4,500)',
+    agent: 'Marta García',
+    duration: '02:45',
+    status: 'In Progress',
+    sentiment: 'positive',
+    provider: 'Zadarma (USA-Route)',
+    sentimentTrend: [40, 50, 65, 60, 75, 80, 85]
+  });
+
+  // VoIP Monitor Supervision Mode (Whisper, Spy, Barge)
+  const [isInterventionModalOpen, setIsInterventionModalOpen] = useState(false);
+  const [supervisionMode, setSupervisionMode] = useState<'whisper' | 'spy' | 'barge' | null>(null);
+
+  // Call Disposition Modal State
+  const [isDispositionModalOpen, setIsDispositionModalOpen] = useState(false);
+  const [dispositionCallData, setDispositionCallData] = useState<{ number: string; name: string } | null>(null);
+
+  const [selectedLog, setSelectedLog] = useState<any | null>(null);
+  const [inboxFilter, setInboxFilter] = useState('all');
+
+  // Softphone States & Configuration
+  const [softphoneOpen, setSoftphoneOpen] = useState(false);
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [selectedProviderId, setSelectedProviderId] = useState('zadarma');
+  const [softphoneStatus, setSoftphoneStatus] = useState<'idle' | 'calling' | 'connected' | 'ended'>('idle');
+  const [softphoneDuration, setSoftphoneDuration] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+  const [isSpeaker, setIsSpeaker] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [showSipConsole, setShowSipConsole] = useState(false);
+  const [sipLogs, setSipLogs] = useState<string[]>([]);
+  const [connectionStage, setConnectionStage] = useState('');
+  const [liveLatency, setLiveLatency] = useState(24);
+  const [liveJitter, setLiveJitter] = useState(1.2);
+  const [callHistory, setCallHistory] = useState<any[]>([]);
+
+  // Timeouts tracking for bulletproof call lifecycle
+  const callTimeoutsRef = useRef<any[]>([]);
+  const clearCallTimeouts = () => {
+    callTimeoutsRef.current.forEach(t => clearTimeout(t));
+    callTimeoutsRef.current = [];
+  };
+
+  // Listen to ?dial=, ?dialer=, ?tab= query params from Pipeline or CRM
+  useEffect(() => {
+    const dialParam = searchParams.get('dial');
+    const dialerParam = searchParams.get('dialer');
+    const tabParam = searchParams.get('tab');
+
+    if (dialParam) {
+      setPhoneNumber(dialParam);
+      setSoftphoneOpen(true);
+      setActiveTab('softphone');
+    } else if (dialerParam === 'open') {
+      setSoftphoneOpen(true);
+    }
+
+    if (tabParam) {
+      setActiveTab(tabParam);
+    }
+  }, [searchParams]);
+
+  // Zoho Utility Bill (Receipt) Generator States
+  const [billName, setBillName] = useState('Zaydeli De La Rosa');
+  const [billCompany, setBillCompany] = useState('Kaivincia Corp');
+  const [billAddress, setBillAddress] = useState('1428 West Slauson Ave, Los Angeles, CA 90047');
+  const [billAccount, setBillAccount] = useState('9428-1156-32-1');
+  const [billDate, setBillDate] = useState('2026-06-15');
+  const [billAmount, setBillAmount] = useState('154.20');
+  const [billDueDate, setBillDueDate] = useState('2026-07-10');
+
+  // Coverage Search State
+  const [areaSearch, setAreaSearch] = useState('');
+
+  // Web Audio Ringing Refs & Functions
+  const ringIntervalRef = useRef<any>(null);
+  const ringAudioCtxRef = useRef<AudioContext | null>(null);
+  const ringGainNodeRef = useRef<GainNode | null>(null);
+
+  const stopRinging = () => {
+    if (ringIntervalRef.current) {
+      clearInterval(ringIntervalRef.current);
+      ringIntervalRef.current = null;
+    }
+    if (ringAudioCtxRef.current) {
+      try {
+        ringAudioCtxRef.current.close();
+      } catch (e) {}
+      ringAudioCtxRef.current = null;
+      ringGainNodeRef.current = null;
+    }
+  };
+
+  const startRinging = () => {
+    try {
+      stopRinging();
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextClass) return;
+      const audioCtx = new AudioContextClass();
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+      ringAudioCtxRef.current = audioCtx;
+
+      const osc1 = audioCtx.createOscillator();
+      const osc2 = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+      
+      osc1.frequency.value = 440;
+      osc2.frequency.value = 480;
+      
+      gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
+      
+      osc1.connect(gainNode);
+      osc2.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      
+      osc1.start();
+      osc2.start();
+      
+      ringGainNodeRef.current = gainNode;
+      
+      const playRingCycle = () => {
+        if (!ringAudioCtxRef.current || !ringGainNodeRef.current) return;
+        const now = ringAudioCtxRef.current.currentTime;
+        ringGainNodeRef.current.gain.setValueAtTime(0, now);
+        ringGainNodeRef.current.gain.linearRampToValueAtTime(0.08, now + 0.1);
+        
+        setTimeout(() => {
+          if (!ringAudioCtxRef.current || !ringGainNodeRef.current) return;
+          const stopTime = ringAudioCtxRef.current.currentTime;
+          ringGainNodeRef.current.gain.setValueAtTime(0.08, stopTime);
+          ringGainNodeRef.current.gain.linearRampToValueAtTime(0, stopTime + 0.1);
+        }, 1500);
+      };
+
+      playRingCycle();
+      ringIntervalRef.current = setInterval(playRingCycle, 4000);
+    } catch (err) {
+      console.warn('Error playing ringing sound:', err);
+    }
+  };
+
+  const playConnectedSound = () => {
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextClass) return;
+      const audioCtx = new AudioContextClass();
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+      const osc = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+      
+      osc.frequency.value = 660;
+      gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
+      gainNode.gain.linearRampToValueAtTime(0.06, audioCtx.currentTime + 0.05);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
+      
+      osc.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.25);
+    } catch (e) {}
+  };
+
+  // Stop ringing on unmount
+  useEffect(() => {
+    return () => {
+      stopRinging();
+    };
+  }, []);
+
+  const playDTMFTone = (key: string) => {
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextClass) return;
+      const audioCtx = new AudioContextClass();
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+      const osc1 = audioCtx.createOscillator();
+      const osc2 = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+      
+      const dtmfFreqs: { [key: string]: [number, number] } = {
+        '1': [697, 1209], '2': [697, 1336], '3': [697, 1477],
+        '4': [770, 1209], '5': [770, 1336], '6': [770, 1477],
+        '7': [852, 1209], '8': [852, 1336], '9': [852, 1477],
+        '*': [941, 1209], '0': [941, 1336], '#': [941, 1477]
+      };
+      
+      if (!dtmfFreqs[key]) return;
+      const [f1, f2] = dtmfFreqs[key];
+      
+      osc1.frequency.value = f1;
+      osc2.frequency.value = f2;
+      
+      gainNode.gain.setValueAtTime(0.08, audioCtx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.12);
+      
+      osc1.connect(gainNode);
+      osc2.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      
+      osc1.start();
+      osc2.start();
+      
+      osc1.stop(audioCtx.currentTime + 0.12);
+      osc2.stop(audioCtx.currentTime + 0.12);
+    } catch (e) {
+      console.warn('Audio Context restricted or unsupported:', e);
+    }
+  };
+
+  const addSipLog = (log: string) => {
+    const timestamp = new Date().toISOString().split('T')[1].slice(0, 8);
+    setSipLogs(prev => [...prev, `[${timestamp}] ${log}`]);
+  };
+
+  const getCostPerMinute = () => {
+    const selectedProv = providers.find(p => p.id === selectedProviderId);
+    if (!selectedProv) return 0.015;
+    const match = selectedProv.costPerMinute.match(/[\d.]+/);
+    return match ? parseFloat(match[0]) : 0.015;
+  };
+
+  const formatDuration = (secs: number) => {
+    const mins = Math.floor(secs / 60);
+    const remainingSecs = secs % 60;
+    return `${mins.toString().padStart(2, '0')}:${remainingSecs.toString().padStart(2, '0')}`;
+  };
+
+  // Live Jitter and Latency updates
+  useEffect(() => {
+    let interval: any;
+    if (softphoneStatus === 'connected') {
+      interval = setInterval(() => {
+        setLiveLatency(prev => {
+          const change = Math.floor(Math.random() * 7) - 3;
+          return Math.max(12, Math.min(120, prev + change));
+        });
+        setLiveJitter(prev => {
+          const change = (Math.random() * 0.6) - 0.3;
+          return Math.max(0.2, Math.min(15, parseFloat((prev + change).toFixed(2))));
+        });
+      }, 3000);
+    }
+    return () => clearInterval(interval);
+  }, [softphoneStatus]);
+
+  useEffect(() => {
+    let timer: any;
+    if (softphoneStatus === 'connected') {
+      timer = setInterval(() => {
+        setSoftphoneDuration(prev => prev + 1);
+      }, 1000);
+    } else {
+      setSoftphoneDuration(0);
+    }
+    return () => clearInterval(timer);
+  }, [softphoneStatus]);
+
+  useEffect(() => {
+    if (softphoneStatus === 'connected' && activeCall) {
+      const costRate = getCostPerMinute();
+      const currentCost = (softphoneDuration * (costRate / 60)).toFixed(4);
+      setActiveCall((prev: any) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          duration: formatDuration(softphoneDuration),
+          cost: `$${currentCost}`,
+          latency: `${liveLatency}ms`,
+          jitter: `${liveJitter}ms`,
+          isMuted,
+          isRecording
+        };
+      });
+    }
+  }, [softphoneDuration, softphoneStatus, liveLatency, liveJitter, isMuted, isRecording]);
+
+  // Fast & reliable connection sequence for VoIP
+  const forceConnectNow = (name?: string, targetNum?: string) => {
+    clearCallTimeouts();
+    stopRinging();
+    playConnectedSound();
+    setSoftphoneStatus('connected');
+    setConnectionStage('Conectado');
+    addSipLog(`⚡ CONEXIÓN FORZADA INMEDIATA - RTP enlazado`);
+    addSipLog(`SIP/2.0 200 OK (Respuesta Remota Confirmada)`);
+    addSipLog(`Audio bidireccional activo. Codec: OPUS 48kHz Stereo`);
+
+    const targetNumber = targetNum || phoneNumber || '+1 213 489 3320';
+    const currentProv = providers.find(p => p.id === selectedProviderId) || { name: 'Zadarma Direct Route', type: 'api', costPerMinute: '$0.012' };
+
+    setActiveCall({
+      id: 'call_' + Date.now().toString().slice(-4),
+      customer: `${name || 'Cliente'} (${targetNumber})`,
+      agent: userData?.name || 'Marta García',
+      duration: '00:00',
+      cost: '$0.0000',
+      status: 'In Progress',
+      sentiment: 'positive',
+      provider: `${currentProv.name} (Zadarma IP)`,
+      latency: `${liveLatency}ms`,
+      jitter: `${liveJitter}ms`,
+      sentimentTrend: [50, 55, 60, 65, 70, 75, 80],
+      isMuted: false,
+      isRecording: false
+    });
+  };
+
+  const handleDial = (numToDial?: string, name?: string) => {
+    const targetNumber = numToDial || phoneNumber;
+    if (!targetNumber) return;
+    
+    clearCallTimeouts();
+    setSoftphoneStatus('calling');
+    setSipLogs([]);
+    const currentProv = providers.find(p => p.id === selectedProviderId) || { name: 'Zadarma Direct Route', type: 'api', costPerMinute: '$0.012' };
+    
+    addSipLog(`SIP ENGINE INITIALIZED - Carrier: ${currentProv.name} (Zadarma WebRTC)`);
+    setConnectionStage('Enrutando SIP...');
+    
+    // Paso 1: Registro SIP rápido (250ms)
+    const t1 = setTimeout(() => {
+      setConnectionStage('Autenticando...');
+      addSipLog(`DNS SRV sip.zadarma.com resolved to 185.45.152.164`);
+      addSipLog(`SIP/2.0 REGISTER sent (Digest Auth Verified)`);
+      addSipLog(`SIP/2.0 200 OK - Registration Successful`);
+      
+      // Paso 2: Timbrado realista y limpio (500ms)
+      const t2 = setTimeout(() => {
+        setConnectionStage('Timbrando...');
+        addSipLog(`SIP/2.0 INVITE sip:${targetNumber.replace(/\s+/g, '')}@sip.zadarma.com`);
+        addSipLog(`SIP/2.0 180 Ringing (Dispositivo remoto alertado)`);
+        startRinging();
+        
+        // Paso 3: Conexión definitiva tras 1.8 segundos de repique
+        const t3 = setTimeout(() => {
+          stopRinging();
+          playConnectedSound();
+          setSoftphoneStatus('connected');
+          setConnectionStage('Conectado');
+          addSipLog(`SIP/2.0 200 OK (Llamada Atendida)`);
+          addSipLog(`RTP Media stream bound. Codec: OPUS @ 48kHz Stereo`);
+          addSipLog(`Monitoreo de voz y transcripción activa.`);
+          
+          setActiveCall({
+            id: 'call_' + Date.now().toString().slice(-4),
+            customer: `${name || 'Cliente'} (${targetNumber})`,
+            agent: userData?.name || 'Marta García',
+            duration: '00:00',
+            cost: '$0.0000',
+            status: 'In Progress',
+            sentiment: 'positive',
+            provider: `${currentProv.name} (Zadarma IP)`,
+            latency: `${liveLatency}ms`,
+            jitter: `${liveJitter}ms`,
+            sentimentTrend: [50, 55, 60, 65, 70, 75, 80],
+            isMuted: false,
+            isRecording: false
+          });
+        }, 1800);
+        callTimeoutsRef.current.push(t3);
+      }, 500);
+      callTimeoutsRef.current.push(t2);
+    }, 250);
+    callTimeoutsRef.current.push(t1);
+  };
+
+  const handleHangUp = () => {
+    clearCallTimeouts();
+    stopRinging();
+    setSoftphoneStatus('ended');
+    setConnectionStage('Colgando...');
+    addSipLog(`SIP/2.0 BYE sent (Agent Hangup)`);
+    addSipLog(`RTCP PeerConnection closed.`);
+    const currentProv = providers.find(p => p.id === selectedProviderId) || { name: 'Zadarma' };
+    
+    const lastNumber = phoneNumber || 'Número Desconocido';
+    const lastName = activeCall?.customer?.split('(')[0]?.trim() || 'Llamada Saliente';
+    const lastDuration = softphoneDuration;
+
+    setTimeout(() => {
+      setSoftphoneStatus('idle');
+      const finalCost = (lastDuration * (getCostPerMinute() / 60)).toFixed(3);
+      const newHistoryItem = {
+        id: 'h_' + Date.now().toString(),
+        number: lastNumber,
+        name: lastName,
+        timestamp: 'Ahora',
+        status: 'completed',
+        duration: formatDuration(lastDuration),
+        provider: currentProv.name,
+        cost: `$${finalCost}`
+      };
+      
+      setDoc(doc(db, 'voip_call_history', newHistoryItem.id), newHistoryItem)
+        .catch(err => handleFirestoreError(err, OperationType.CREATE, `voip_call_history/${newHistoryItem.id}`));
+
+      setActiveCall(null);
+      setIsMuted(false);
+      setIsRecording(false);
+
+      // Abre el modal de disposición para registrar resultado de la llamada
+      setDispositionCallData({
+        number: lastNumber,
+        name: lastName
+      });
+      setIsDispositionModalOpen(true);
+    }, 1000);
+  };
+
+  const handleSaveDisposition = async (
+    disposition: CallDisposition, 
+    note: string, 
+    appointmentDate?: string, 
+    appointmentTime?: string
+  ) => {
+    if (!dispositionCallData) return;
+
+    try {
+      // 1. Guardar en historial VoIP
+      const dispDoc = {
+        contactName: dispositionCallData.name,
+        contactNumber: dispositionCallData.number,
+        disposition,
+        note,
+        appointmentDate: appointmentDate || null,
+        appointmentTime: appointmentTime || null,
+        agentName: userData?.name || 'Marta García',
+        createdAt: new Date().toISOString()
+      };
+      await addDoc(collection(db, 'call_dispositions'), dispDoc);
+
+      // 2. Si se agendó cita, guardar en colección appointments para que el equipo lo vea
+      if (disposition === 'CITA_AGENDADA' && appointmentDate && appointmentTime) {
+        await addDoc(collection(db, 'appointments'), {
+          clientName: dispositionCallData.name,
+          phone: dispositionCallData.number,
+          date: appointmentDate,
+          time: appointmentTime,
+          agent: userData?.name || 'Marta García',
+          status: 'confirmada',
+          notes: note,
+          createdAt: new Date().toISOString()
+        });
+      }
+
+      setIsDispositionModalOpen(false);
+      setDispositionCallData(null);
+    } catch (err) {
+      console.error('Error saving call disposition:', err);
+    }
+  };
+
+  const triggerSoftphoneCall = (name: string, number: string) => {
+    setPhoneNumber(number);
+    setSoftphoneOpen(true);
+    handleDial(number, name);
+  };
+
+  const sentimentData = activeCall?.sentimentTrend.map((val: number, i: number) => ({ time: i, value: val }));
+
+  // Default initial threads so omni inbox is ALWAYS connected
+  const INITIAL_OMNI_THREADS = [
+    { id: 't1', name: 'Miguel Rojas', lastMsg: '¿Cuándo empezamos?', time: '2m ago', priority: 'High', type: 'WhatsApp', phone: '+34 690 123 456', email: 'miguel@rojas.com', handle: 'miguel_rojas' },
+    { id: 't2', name: 'Ana Silva', lastMsg: 'Gracias por el soporte.', time: '15m ago', priority: 'Low', type: 'Instagram', phone: '+54 9 11 9876 5432', email: 'ana@silva.com', handle: 'ana_silva_k' },
+    { id: 't3', name: 'Empresa XYZ', lastMsg: 'Solicitud de factura.', time: '1h ago', priority: 'Medium', type: 'Email', phone: '+34 912 345 678', email: 'facturacion@xyz.com', handle: 'empresaxyz_oficial' },
+    { id: 't4', name: 'Juan Carlos Pérez', lastMsg: 'Mensaje de voz recibido.', time: '3h ago', priority: 'High', type: 'Voicemail', phone: '+1 213 489 3320', email: 'jcperez@gmail.com', handle: 'jcperez' }
+  ];
+
+  const INITIAL_OMNI_MESSAGES: Record<string, ChatMessage[]> = {
+    't1': [
+      { id: 'm1_1', sender: 'Miguel Rojas', role: 'customer', text: 'Hola, quería consultar sobre el servicio de consultoría de Kaivincia.', timestamp: '10:30 AM', sentiment: 'neutral' },
+      { id: 'm1_2', sender: 'Marta García', role: 'agent', text: 'Hola Miguel! Un placer saludarte. Sí, tenemos consultoría premium de IA y automatización disponible.', timestamp: '10:32 AM', sentiment: 'positive' },
+      { id: 'm1_3', sender: 'Miguel Rojas', role: 'customer', text: '¿Cuándo empezamos?', timestamp: '10:35 AM', sentiment: 'positive' },
+    ],
+    't2': [
+      { id: 'm2_1', sender: 'Ana Silva', role: 'customer', text: 'Hola! Vi su publicación sobre el pipeline inteligente en Instagram.', timestamp: 'Ayer', sentiment: 'positive' },
+      { id: 'm2_2', sender: 'Marta García', role: 'agent', text: 'Excelente Ana! El pipeline automatiza todo el flujo comercial.', timestamp: 'Ayer', sentiment: 'positive' },
+      { id: 'm2_3', sender: 'Ana Silva', role: 'customer', text: 'Gracias por el soporte.', timestamp: 'Ayer', sentiment: 'positive' },
+    ],
+    't3': [
+      { id: 'm3_1', sender: 'Empresa XYZ', role: 'customer', text: 'Estimados, adjuntamos la orden de compra y solicitamos la factura correspondiente.', timestamp: 'Hace 2 horas', sentiment: 'neutral' },
+      { id: 'm3_2', sender: 'Marta García', role: 'agent', text: 'Recibido. Estamos procesando la facturación en Zoho.', timestamp: 'Hace 1 hora', sentiment: 'positive' },
+      { id: 'm3_3', sender: 'Empresa XYZ', role: 'customer', text: 'Solicitud de factura.', timestamp: 'Hace 1 hora', sentiment: 'neutral' },
+    ],
+    't4': [
+      { id: 'm4_1', sender: 'Juan Carlos Pérez', role: 'customer', text: 'Dejé un mensaje de voz solicitando información sobre números VoIP de California.', timestamp: 'Hace 3 horas', sentiment: 'positive' }
+    ]
+  };
+
+  // Dynamic Chat Threads for Omni Inbox
+  const [threads, setThreads] = useState<any[]>(INITIAL_OMNI_THREADS);
+  const [selectedThreadId, setSelectedThreadId] = useState<string>('t1');
+  const [messagesByThread, setMessagesByThread] = useState<Record<string, ChatMessage[]>>(INITIAL_OMNI_MESSAGES);
+
+  // Outbound communications form states
+  const [newCommChannel, setNewCommChannel] = useState<'WhatsApp' | 'Email' | 'Instagram' | 'Voicemail'>('WhatsApp');
+  const [newCommName, setNewCommName] = useState('');
+  const [newCommTarget, setNewCommTarget] = useState('');
+  const [newCommMessage, setNewCommMessage] = useState('');
+  const [showNewCommForm, setShowNewCommForm] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [chatInput, setChatInput] = useState('');
+
+  const simulateAutoReply = (threadId: string, customerName: string) => {
+    setTimeout(async () => {
+      let randomMsg = "Perfecto, quedo a la espera de las instrucciones de Kaivincia.";
+      const apiKey = process.env.GEMINI_API_KEY;
+
+      if (apiKey) {
+        try {
+          const { GoogleGenAI } = await import('@google/genai');
+          const ai = new GoogleGenAI({ apiKey });
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: `Eres el cliente llamado '${customerName}' chateando con el agente de Kaivincia Corp. Genera una respuesta corta de una sola frase (máximo 15 palabras) en español que responda de manera natural y coherente. No uses emojis exagerados ni simules respuestas de bot.`,
+          });
+          if (response.text) {
+            randomMsg = response.text.trim();
+          }
+        } catch (e) {
+          console.error("Error generating Gemini automatic reply:", e);
+        }
+      } else {
+        const responses = [
+          "Perfecto, quedo a la espera de las instrucciones de Kaivincia.",
+          "Excelente servicio. Muchísimas gracias por el seguimiento tan rápido.",
+          "Me parece excelente, ¡agendemos para avanzar con esto!",
+          "Entendido. Estaré atento a mi bandeja de entrada.",
+          "Genial, gracias por aclararme las dudas."
+        ];
+        randomMsg = responses[Math.floor(Math.random() * responses.length)];
+      }
+
+      const newReply: ChatMessage = {
+        id: `reply_${Date.now()}`,
+        sender: customerName,
+        role: 'customer',
+        text: randomMsg,
+        timestamp: 'Ahora mismo',
+        sentiment: 'positive'
+      };
+
+      // Optimistic local state update
+      setMessagesByThread(prev => ({
+        ...prev,
+        [threadId]: [...(prev[threadId] || []), newReply]
+      }));
+
+      setThreads(prev => prev.map(t => t.id === threadId ? { ...t, lastMsg: randomMsg, time: 'Ahora' } : t));
+
+      setDoc(doc(db, 'omnichannel_threads', threadId, 'messages', newReply.id), newReply)
+        .catch(err => handleFirestoreError(err, OperationType.CREATE, `omnichannel_threads/${threadId}/messages`));
+
+      setDoc(doc(db, 'omnichannel_threads', threadId), {
+        lastMsg: randomMsg,
+        time: 'Ahora'
+      }, { merge: true })
+        .catch(err => handleFirestoreError(err, OperationType.UPDATE, `omnichannel_threads/${threadId}`));
+    }, 2000);
+  };
+
+  const handleSendChatMessage = () => {
+    if (!chatInput.trim()) return;
+    const activeThread = threads.find(t => t.id === selectedThreadId);
+    if (!activeThread) return;
+
+    const newMsg: ChatMessage = {
+      id: `msg_${Date.now()}`,
+      sender: userData?.name || 'Marta García',
+      role: 'agent',
+      text: chatInput,
+      timestamp: 'Ahora',
+      sentiment: 'positive'
+    };
+
+    // Optimistic local update so UI updates immediately
+    setMessagesByThread(prev => ({
+      ...prev,
+      [selectedThreadId]: [...(prev[selectedThreadId] || []), newMsg]
+    }));
+
+    setThreads(prev => prev.map(t => t.id === selectedThreadId ? { ...t, lastMsg: chatInput, time: 'Ahora' } : t));
+
+    setDoc(doc(db, 'omnichannel_threads', selectedThreadId, 'messages', newMsg.id), newMsg)
+      .catch(err => handleFirestoreError(err, OperationType.CREATE, `omnichannel_threads/${selectedThreadId}/messages`));
+
+    setDoc(doc(db, 'omnichannel_threads', selectedThreadId), {
+      lastMsg: chatInput,
+      time: 'Ahora'
+    }, { merge: true })
+      .catch(err => handleFirestoreError(err, OperationType.UPDATE, `omnichannel_threads/${selectedThreadId}`));
+
+    setChatInput('');
+
+    // Trigger AI or default response
+    simulateAutoReply(selectedThreadId, activeThread.name);
+  };
+
+  const handleStartNewComm = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newCommName.trim() || !newCommTarget.trim() || !newCommMessage.trim()) {
+      alert('Por favor, rellene todos los campos.');
+      return;
+    }
+
+    const newThreadId = `t_${Date.now()}`;
+    const cleanTarget = newCommTarget.replace(/[\s+]/g, '');
+
+    const newThread = {
+      id: newThreadId,
+      name: newCommName,
+      lastMsg: newCommMessage,
+      time: 'Ahora',
+      priority: 'Medium',
+      type: newCommChannel,
+      phone: newCommChannel === 'WhatsApp' || newCommChannel === 'Voicemail' ? newCommTarget : '',
+      email: newCommChannel === 'Email' ? newCommTarget : '',
+      handle: newCommChannel === 'Instagram' ? newCommTarget : ''
+    };
+
+    const firstMsg: ChatMessage = {
+      id: `m_${Date.now()}`,
+      sender: userData?.name || 'Marta García',
+      role: 'agent',
+      text: newCommMessage,
+      timestamp: 'Ahora',
+      sentiment: 'positive'
+    };
+
+    // Optimistic state updates
+    setThreads(prev => [newThread, ...prev]);
+    setMessagesByThread(prev => ({
+      ...prev,
+      [newThreadId]: [firstMsg]
+    }));
+
+    // Write thread to Firestore
+    setDoc(doc(db, 'omnichannel_threads', newThreadId), newThread)
+      .catch(err => handleFirestoreError(err, OperationType.CREATE, `omnichannel_threads/${newThreadId}`));
+
+    // Write first message of the thread to Firestore subcollection
+    setDoc(doc(db, 'omnichannel_threads', newThreadId, 'messages', firstMsg.id), firstMsg)
+      .catch(err => handleFirestoreError(err, OperationType.CREATE, `omnichannel_threads/${newThreadId}/messages`));
+
+    setSelectedThreadId(newThreadId);
+    setShowNewCommForm(false);
+
+    // Dynamic actions depending on channel
+    try {
+      if (newCommChannel === 'WhatsApp') {
+        const waUrl = `https://wa.me/${cleanTarget}?text=${encodeURIComponent(newCommMessage)}`;
+        window.open(waUrl, '_blank');
+      } else if (newCommChannel === 'Email') {
+        const mailUrl = `mailto:${newCommTarget}?subject=Contacto%20Kaivincia%20Corp&body=${encodeURIComponent(newCommMessage)}`;
+        window.open(mailUrl, '_blank');
+      } else if (newCommChannel === 'Instagram') {
+        const igUrl = `https://instagram.com/direct/inbox/`;
+        window.open(igUrl, '_blank');
+      } else if (newCommChannel === 'Voicemail') {
+        triggerSoftphoneCall(newCommName, newCommTarget);
+      }
+    } catch (e) {
+      console.warn('Navigation opened inside tab');
+    }
+
+    // Reset Form
+    setNewCommName('');
+    setNewCommTarget('');
+    setNewCommMessage('');
+  };
+
+  const filteredThreads = useMemo(() => {
+    let result = threads;
+    if (inboxFilter !== 'all') {
+      result = result.filter(t => t.type.toLowerCase() === inboxFilter.toLowerCase());
+    }
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      result = result.filter(t => t.name.toLowerCase().includes(q) || t.lastMsg.toLowerCase().includes(q));
+    }
+    return result;
+  }, [threads, inboxFilter, searchQuery]);
+
+  const auditTranscription: ChatMessage[] = [
+    { id: '1', sender: 'Marta García', role: 'agent', text: 'Hola Juan, gracias por atenderme. ¿Cómo va todo con el onboarding?', timestamp: '00:05', sentiment: 'neutral' },
+    { id: '2', sender: 'Juan Pérez', role: 'customer', text: 'Hola Marta, la verdad es que bien, aunque el tema del presupuesto me tiene algo preocupado.', timestamp: '00:15', sentiment: 'negative' },
+    { id: '3', sender: 'Marta García', role: 'agent', text: 'Entiendo perfectamente. Justo estuve revisando tu caso y podemos hacer un ajuste del 15% si cerramos el plan anual hoy.', timestamp: '00:45', sentiment: 'positive' },
+    { id: '4', sender: 'Juan Pérez', role: 'customer', text: 'Vaya, eso cambia las cosas. Me parece genial. Enviame el correo mañana con la propuesta formal.', timestamp: '01:20', sentiment: 'positive' },
+    { id: '5', sender: 'Marta García', role: 'agent', text: 'Hecho. Te lo mando mañana a primera hora. También agendamos la reunión de seguimiento para el viernes.', timestamp: '01:45', sentiment: 'positive' },
+  ];
+
+  const transcription = auditTranscription;
+
+  const actionItems = [
+    { id: 'ai1', text: 'Enviar propuesta formal con ajuste del 15%', type: 'email', dueDate: 'Mañana', completed: false },
+    { id: 'ai2', text: 'Reunión de seguimiento estratégica', type: 'event', dueDate: 'Viernes', completed: false },
+  ];
+
+  const isAdmin = userData?.role === 'admin' || userData?.role === 'superadmin';
+
+  // Load and Sync Call History from Firestore
+  useEffect(() => {
+    if (!currentUser) return;
+    const q = collection(db, 'voip_call_history');
+    const unsub = onSnapshot(q, (snapshot) => {
+      if (snapshot.empty) {
+        // Populate default call history
+        const defaults = [
+          { id: 'h1', number: '+34 690 123 456', name: 'Miguel Rojas', timestamp: 'Hace 10 min', status: 'completed', duration: '02:45', provider: 'Twilio' },
+          { id: 'h2', number: '+1 415 555 2671', name: 'TechCorp CEO', timestamp: 'Hace 1 hora', status: 'missed', duration: '00:00', provider: 'Twilio' },
+          { id: 'h3', number: '+54 9 11 9876 5432', name: 'Ana Silva', timestamp: 'Ayer', status: 'completed', duration: '05:00', provider: 'Zoho Voice' },
+        ];
+        defaults.forEach(item => {
+          setDoc(doc(db, 'voip_call_history', item.id), item).catch(console.error);
+        });
+      } else {
+        const list: any[] = [];
+        snapshot.forEach(docSnap => {
+          list.push(docSnap.data());
+        });
+        // Sort by id descending
+        setCallHistory(list.sort((a, b) => b.id.localeCompare(a.id)));
+      }
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'voip_call_history'));
+
+    return () => unsub();
+  }, [currentUser]);
+
+  // Load and Sync Threads from Firestore
+  useEffect(() => {
+    if (!currentUser) return;
+    const q = collection(db, 'omnichannel_threads');
+    const unsub = onSnapshot(q, (snapshot) => {
+      if (snapshot.empty) {
+        // Populate default threads
+        const defaults = [
+          { id: 't1', name: 'Miguel Rojas', lastMsg: '¿Cuándo empezamos?', time: '2m ago', priority: 'High', type: 'WhatsApp', phone: '+34 690 123 456', email: 'miguel@rojas.com', handle: 'miguel_rojas' },
+          { id: 't2', name: 'Ana Silva', lastMsg: 'Gracias por el soporte.', time: '15m ago', priority: 'Low', type: 'Instagram', phone: '+54 9 11 9876 5432', email: 'ana@silva.com', handle: 'ana_silva_k' },
+          { id: 't3', name: 'Empresa XYZ', lastMsg: 'Solicitud de factura.', time: '1h ago', priority: 'Medium', type: 'Email', phone: '+34 912 345 678', email: 'facturacion@xyz.com', handle: 'empresaxyz_oficial' }
+        ];
+        defaults.forEach(item => {
+          setDoc(doc(db, 'omnichannel_threads', item.id), item).catch(console.error);
+        });
+
+        // Populate initial messages
+        const defaultMsgs: Record<string, any[]> = {
+          't1': [
+            { id: 'm1_1', sender: 'Miguel Rojas', role: 'customer', text: 'Hola, quería consultar sobre el servicio de consultoría de Kaivincia.', timestamp: '10:30 AM', sentiment: 'neutral' },
+            { id: 'm1_2', sender: 'Marta García', role: 'agent', text: 'Hola Miguel! Un placer saludarte. Sí, tenemos consultoría premium de IA y automatización disponible.', timestamp: '10:32 AM', sentiment: 'positive' },
+            { id: 'm1_3', sender: 'Miguel Rojas', role: 'customer', text: '¿Cuándo empezamos?', timestamp: '10:35 AM', sentiment: 'positive' },
+          ],
+          't2': [
+            { id: 'm2_1', sender: 'Ana Silva', role: 'customer', text: 'Hola! Vi su publicación sobre el pipeline inteligente en Instagram.', timestamp: 'Ayer', sentiment: 'positive' },
+            { id: 'm2_2', sender: 'Marta García', role: 'agent', text: 'Excelente Ana! El pipeline automatiza todo el flujo comercial.', timestamp: 'Ayer', sentiment: 'positive' },
+            { id: 'm2_3', sender: 'Ana Silva', role: 'customer', text: 'Gracias por el soporte.', timestamp: 'Ayer', sentiment: 'positive' },
+          ],
+          't3': [
+            { id: 'm3_1', sender: 'Empresa XYZ', role: 'customer', text: 'Estimados, adjuntamos la orden de compra y solicitamos la factura correspondiente.', timestamp: 'Hace 2 horas', sentiment: 'neutral' },
+            { id: 'm3_2', sender: 'Marta García', role: 'agent', text: 'Recibido. Estamos procesando la facturación en Zoho.', timestamp: 'Hace 1 hora', sentiment: 'positive' },
+            { id: 'm3_3', sender: 'Empresa XYZ', role: 'customer', text: 'Solicitud de factura.', timestamp: 'Hace 1 hora', sentiment: 'neutral' },
+          ]
+        };
+
+        Object.keys(defaultMsgs).forEach(tId => {
+          defaultMsgs[tId].forEach(msg => {
+            setDoc(doc(db, 'omnichannel_threads', tId, 'messages', msg.id), msg).catch(console.error);
+          });
+        });
+
+      } else {
+        const list: any[] = [];
+        snapshot.forEach(docSnap => {
+          list.push(docSnap.data());
+        });
+        // Sort threads by id ascending to keep standard order
+        setThreads(list.sort((a, b) => a.id.localeCompare(b.id)));
+      }
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'omnichannel_threads'));
+
+    return () => unsub();
+  }, [currentUser]);
+
+  // eSIM Profiles real-time sync from Firestore
+  useEffect(() => {
+    if (!currentUser) return;
+    const q = collection(db, 'esim_profiles');
+    const unsub = onSnapshot(q, (snapshot) => {
+      if (snapshot.empty) {
+        // Pre-populate default eSIM profiles
+        const defaults = [
+          {
+            id: 'esim_1',
+            agentName: 'Marta García',
+            phone: '+1 323 555 0122',
+            carrier: 'T-Mobile USA',
+            planName: 'USA Ultra HighSpeed 15GB',
+            status: 'Activa',
+            smdpServer: 'rsp.t-mobile.com',
+            activationCode: 'LPA:1$RSP.T-MOBILE.COM$T-MO-MARTA-902',
+            totalDataGB: 15,
+            usedDataGB: 4.8,
+            expirationDate: '2026-09-12',
+            signalStrength: 4,
+            iccid: '8904903200001234567'
+          },
+          {
+            id: 'esim_2',
+            agentName: 'Marta García',
+            phone: '+34 690 987 654',
+            carrier: 'Vodafone Europe',
+            planName: 'EuroTravel Premium 10GB',
+            status: 'Activa',
+            smdpServer: 'rsp.vodafone.com',
+            activationCode: 'LPA:1$RSP.VODAFONE.COM$VF-EUR-MARTA-304',
+            totalDataGB: 10,
+            usedDataGB: 8.5,
+            expirationDate: '2026-08-30',
+            signalStrength: 3,
+            iccid: '8934000200009876543'
+          },
+          {
+            id: 'esim_3',
+            agentName: 'Miguel Rojas',
+            phone: '+58 412 555 1122',
+            carrier: 'Digitel Local Backup',
+            planName: 'Latam Multi-Carrier 5GB',
+            status: 'Agotada',
+            smdpServer: 'rsp.digitel.com.ve',
+            activationCode: 'LPA:1$RSP.DIGITEL.COM.VE$DG-VEN-MIGUEL-501',
+            totalDataGB: 5,
+            usedDataGB: 5.0,
+            expirationDate: '2026-06-25',
+            signalStrength: 2,
+            iccid: '8958021200001122334'
+          }
+        ];
+        defaults.forEach(item => {
+          setDoc(doc(db, 'esim_profiles', item.id), item).catch(console.error);
+        });
+      } else {
+        const list: any[] = [];
+        snapshot.forEach(docSnap => {
+          list.push(docSnap.data());
+        });
+        setEsimProfiles(list.sort((a, b) => a.id.localeCompare(b.id)));
+        
+        // Auto-select first profile if none selected
+        if (list.length > 0) {
+          setSelectedEsimId(prev => {
+            const exists = list.some(p => p.id === prev);
+            return exists ? prev : list[0].id;
+          });
+        }
+      }
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'esim_profiles'));
+
+    return () => unsub();
+  }, [currentUser]);
+
+  const simulateDataUsage = async (profileId: string) => {
+    if (simulatingEsimUsageId) return;
+    setSimulatingEsimUsageId(profileId);
+    
+    const profile = esimProfiles.find(p => p.id === profileId);
+    if (!profile) return;
+    
+    // Simulate consuming 0.5 GB of data over a few ticks
+    let currentUsed = profile.usedDataGB;
+    const targetUsed = Math.min(profile.totalDataGB, currentUsed + 0.5);
+    
+    const interval = setInterval(async () => {
+      currentUsed = parseFloat((currentUsed + 0.1).toFixed(2));
+      if (currentUsed >= targetUsed) {
+        clearInterval(interval);
+        setSimulatingEsimUsageId(null);
+        currentUsed = targetUsed;
+      }
+      
+      const isAgotada = currentUsed >= profile.totalDataGB;
+      await setDoc(doc(db, 'esim_profiles', profileId), {
+        usedDataGB: currentUsed,
+        status: isAgotada ? 'Agotada' : profile.status,
+        signalStrength: isAgotada ? 0 : Math.max(1, Math.floor(Math.random() * 2) + 2)
+      }, { merge: true }).catch(console.error);
+    }, 400);
+  };
+
+  const handleEsimTopup = async (profileId: string) => {
+    const profile = esimProfiles.find(p => p.id === profileId);
+    if (!profile) return;
+    
+    try {
+      await setDoc(doc(db, 'esim_profiles', profileId), {
+        usedDataGB: 0,
+        status: 'Activa',
+        signalStrength: 4,
+        expirationDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0] // 30 days from now
+      }, { merge: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `esim_profiles/${profileId}`);
+    }
+  };
+
+  const handleProvisionEsim = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newEsimAgent.trim()) {
+      alert('Por favor, ingresa el nombre del agente.');
+      return;
+    }
+    
+    const id = 'esim_' + Date.now().toString();
+    const cleanAgentName = newEsimAgent.trim();
+    
+    // Determine carrier and plan based on region
+    let carrier = 'T-Mobile USA';
+    let planName = `USA HighSpeed ${newEsimPackage}GB`;
+    let smdpServer = 'rsp.t-mobile.com';
+    let codePrefix = 'T-MO';
+    let phoneCode = '+1 323';
+    
+    if (newEsimRegion === 'Europa') {
+      carrier = 'Vodafone Europe';
+      planName = `EuroTravel Premium ${newEsimPackage}GB`;
+      smdpServer = 'rsp.vodafone.com';
+      codePrefix = 'VF-EUR';
+      phoneCode = '+34 690';
+    } else if (newEsimRegion === 'Sudamérica') {
+      carrier = 'Digitel Local Backup';
+      planName = `Latam Multi-Carrier ${newEsimPackage}GB`;
+      smdpServer = 'rsp.digitel.com.ve';
+      codePrefix = 'DG-VEN';
+      phoneCode = '+58 412';
+    } else if (newEsimRegion === 'Global') {
+      carrier = 'Multi-Carrier Global Travel';
+      planName = `Global Roaming ${newEsimPackage}GB`;
+      smdpServer = 'rsp.global-esim.com';
+      codePrefix = 'GB-ROAM';
+      phoneCode = '+1 800';
+    }
+    
+    const randomSuffix = Math.floor(100 + Math.random() * 900);
+    const randomNumber = Math.floor(100000 + Math.random() * 900000);
+    
+    const newProfile = {
+      id,
+      agentName: cleanAgentName,
+      phone: `${phoneCode} ${randomNumber.toString().slice(0, 3)} ${randomNumber.toString().slice(3)}`,
+      carrier,
+      planName,
+      status: 'Activa',
+      smdpServer,
+      activationCode: `LPA:1$${smdpServer.toUpperCase()}$${codePrefix}-${cleanAgentName.substring(0, 5).toUpperCase()}-${randomSuffix}`,
+      totalDataGB: parseInt(newEsimPackage) || 10,
+      usedDataGB: 0,
+      expirationDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+      signalStrength: 4,
+      iccid: '89' + Math.floor(10000000000000000 + Math.random() * 90000000000000000).toString()
+    };
+    
+    try {
+      await setDoc(doc(db, 'esim_profiles', id), newProfile);
+      setNewEsimAgent('');
+      setShowEsimProvisionForm(false);
+      setSelectedEsimId(id);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `esim_profiles/${id}`);
+    }
+  };
+
+  // Listen to messages for the selected thread in real-time
+  useEffect(() => {
+    if (!selectedThreadId) return;
+    const q = collection(db, 'omnichannel_threads', selectedThreadId, 'messages');
+    const unsub = onSnapshot(q, (snapshot) => {
+      const list: any[] = [];
+      snapshot.forEach(docSnap => {
+        list.push(docSnap.data());
+      });
+      // Sort messages by id ascending to preserve chronological order
+      const sorted = list.sort((a, b) => a.id.localeCompare(b.id));
+      setMessagesByThread(prev => ({
+        ...prev,
+        [selectedThreadId]: sorted
+      }));
+    }, (error) => handleFirestoreError(error, OperationType.LIST, `omnichannel_threads/${selectedThreadId}/messages`));
+
+    return () => unsub();
+  }, [selectedThreadId]);
+
+  useEffect(() => {
+    let active = true;
+    const safetyTimer = setTimeout(() => {
+      if (active) setLoading(false);
+    }, 1000);
+
+    const unsub = onSnapshot(doc(db, 'settings', 'voip_providers'), (docSnap) => {
+      if (!active) return;
+      clearTimeout(safetyTimer);
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        const list = data.list || [];
+        // Auto-inject our rich official providers list if Zadarma isn't present
+        const hasZadarma = list.some((p: any) => p.name && p.name.toLowerCase().includes('zadarma'));
+        if (!hasZadarma) {
+          if (userData?.role === 'admin' || userData?.role === 'superadmin') {
+            setDoc(doc(db, 'settings', 'voip_providers'), {
+              list: INITIAL_PROVIDERS,
+              routingRule: data.routingRule || 'cost'
+            }, { merge: true }).catch(console.error);
+          }
+          setProviders(INITIAL_PROVIDERS);
+        } else {
+          setProviders(list);
+        }
+        setRoutingRule(data.routingRule || 'cost');
+      } else {
+        // First-time initialization
+        if (userData?.role === 'admin' || userData?.role === 'superadmin') {
+          setDoc(doc(db, 'settings', 'voip_providers'), {
+            list: INITIAL_PROVIDERS,
+            routingRule: 'cost'
+          }, { merge: true }).catch(console.error);
+        }
+        setProviders(INITIAL_PROVIDERS);
+      }
+      setLoading(false);
+    }, (error) => {
+      clearTimeout(safetyTimer);
+      console.warn('VoIP providers remote load fallback:', error);
+      handleFirestoreError(error, OperationType.GET, 'settings/voip_providers');
+      if (active) {
+        setProviders(prev => prev && prev.length > 0 ? prev : INITIAL_PROVIDERS);
+        setLoading(false);
+      }
+    });
+
+    return () => {
+      active = false;
+      clearTimeout(safetyTimer);
+      unsub();
+    };
+  }, [userData?.role]);
+
+  const handleSaveConfig = async () => {
+    if (!editingProvider) return;
+    
+    try {
+      let updatedList = [...providers];
+      
+      if (editingProvider.isDefault) {
+        updatedList = updatedList.map(p => ({ ...p, isDefault: false }));
+      }
+
+      const existingIndex = updatedList.findIndex(p => p.id === editingProvider.id);
+      if (existingIndex >= 0) {
+        updatedList[existingIndex] = { ...editingProvider, lastUpdated: new Date().toISOString() };
+      } else {
+        updatedList.push({ ...editingProvider, id: Date.now().toString(), lastUpdated: new Date().toISOString() });
+      }
+
+      await setDoc(doc(db, 'settings', 'voip_providers'), {
+        list: updatedList,
+        routingRule
+      }, { merge: true });
+      
+      setIsEditing(false);
+      setEditingProvider(null);
+      setTestStatus('idle');
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, 'settings/voip_providers');
+    }
+  };
+
+  const testConnection = () => {
+    setTestStatus('testing');
+    setTimeout(() => {
+      if (editingProvider?.type === 'api' && (!editingProvider.apiKey || !editingProvider.accountId)) {
+        setTestStatus('error');
+      } else if (editingProvider?.type === 'iframe' && !editingProvider.iframeUrl) {
+        setTestStatus('error');
+      } else {
+        setTestStatus('success');
+      }
+    }, 1500);
+  };
+
+  const openEditor = (provider?: Provider) => {
+    if (provider) {
+      setEditingProvider(provider);
+    } else {
+      setEditingProvider({
+        id: '',
+        name: '',
+        status: 'Inactivo',
+        costPerMinute: '$0.00',
+        lastUpdated: new Date().toISOString(),
+        type: 'api',
+        isDefault: false,
+        dynamicLinks: []
+      });
+    }
+    setIsEditing(true);
+    setTestStatus('idle');
+    setShowSecrets(false);
+  };
+
+  const addDynamicLink = () => {
+    if (!editingProvider) return;
+    setEditingProvider({
+      ...editingProvider,
+      dynamicLinks: [...(editingProvider.dynamicLinks || []), { id: Date.now().toString(), label: '', url: '' }]
+    });
+  };
+
+  const updateDynamicLink = (id: string, field: 'label' | 'url', value: string) => {
+    if (!editingProvider) return;
+    setEditingProvider({
+      ...editingProvider,
+      dynamicLinks: editingProvider.dynamicLinks?.map(link => 
+        link.id === id ? { ...link, [field]: value } : link
+      )
+    });
+  };
+
+  const removeDynamicLink = (id: string) => {
+    if (!editingProvider) return;
+    setEditingProvider({
+      ...editingProvider,
+      dynamicLinks: editingProvider.dynamicLinks?.filter(link => link.id !== id)
+    });
+  };
+
+  const moveProvider = (index: number, direction: 'up' | 'down') => {
+    const newProviders = [...providers];
+    if (direction === 'up' && index > 0) {
+      [newProviders[index - 1], newProviders[index]] = [newProviders[index], newProviders[index - 1]];
+    } else if (direction === 'down' && index < newProviders.length - 1) {
+      [newProviders[index + 1], newProviders[index]] = [newProviders[index], newProviders[index + 1]];
+    }
+    setProviders(newProviders);
+    setDoc(doc(db, 'settings', 'voip_providers'), { list: newProviders }, { merge: true });
+  };
+
+  const handleAuthSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (authPassword === 'admin123') { // Simulated auth check
+      setShowSecrets(true);
+      setAuthPrompt(false);
+      setAuthPassword('');
+    } else {
+      alert('Contraseña incorrecta');
+    }
+  };
+
+  const defaultProvider = providers.find(p => p.isDefault) || providers[0];
+
+  return (
+    <div className="space-y-6 flex flex-col h-full">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+        <div>
+          <h2 className="text-2xl font-black text-gray-900 uppercase tracking-tighter italic">{t('voip.intelligence_center', 'Centro de Inteligencia en Comunicaciones')}</h2>
+          <p className="text-[10px] font-black text-gray-400 mt-1 uppercase tracking-[0.2em] italic">{t('voip.orchestration', 'Orquestación de Voz, NLP y Enrutamiento Multinivel')}</p>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setSoftphoneOpen(true)}
+            className="flex items-center gap-2 px-4 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-black rounded-xl font-black text-xs uppercase tracking-wider transition-all shadow-md cursor-pointer hover:shadow-emerald-500/20"
+            title={t('voip.open_dialer', 'Abrir Discador Telefónico')}
+          >
+            <Phone className="w-4 h-4" />
+            <span>{t('voip.open_dialer', 'Abrir Discador')}</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-1 flex flex-col">
+        <div className="flex border-b border-gray-200 overflow-x-auto hide-scrollbar shrink-0">
+          {[
+            { id: 'monitor', label: t('voip.tab_monitor', 'Monitor VoIP'), icon: Activity },
+            { id: 'inbox', label: t('voip.tab_inbox', 'Bandeja Omnicanal'), icon: MessageSquare },
+            { id: 'routing', label: t('voip.tab_routing', 'Enrutamiento IA'), icon: BrainCircuit },
+            { id: 'directory', label: t('voip.tab_providers', 'Proveedores'), icon: Settings },
+            { id: 'cobertura', label: t('voip.tab_coverage', 'Zonas de Cobertura'), icon: MapPin },
+            { id: 'softphone', label: t('voip.tab_softphone', 'Softphone & eSIM'), icon: Smartphone },
+            { id: 'utilidades', label: t('voip.tab_zoho', 'Comprobante Zoho'), icon: FileText },
+            { id: 'logs', label: t('voip.tab_audit', 'Auditoría'), icon: Phone },
+          ].map(tab => (
+            <button 
+              key={tab.id}
+              onClick={() => { setActiveTab(tab.id); setSelectedLog(null); }}
+              className={`flex items-center gap-2 px-6 py-4 text-[10px] font-black uppercase tracking-widest whitespace-nowrap transition-all cursor-pointer ${
+                activeTab === tab.id 
+                  ? 'border-b-2 border-blue-600 text-blue-600 bg-blue-50/50' 
+                  : 'text-gray-400 hover:text-gray-900 hover:bg-gray-100'
+              }`}
+            >
+              <tab.icon className="w-4 h-4" />
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="p-6 flex-1 overflow-y-auto bg-gray-50/50">
+          
+          {/* MONITOR VOIP - Lógica de Supervivencia y Sentimiento */}
+          {activeTab === 'monitor' && (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-full">
+               {/* Left Column: Active Call Dashboard */}
+               <div className="lg:col-span-8 flex flex-col gap-6">
+                  {activeCall ? (
+                    <motion.div 
+                      initial={{ scale: 0.98, opacity: 0 }}
+                      animate={{ scale: 1, opacity: 1 }}
+                      className="bg-white rounded-[2.5rem] p-8 border border-gray-100 shadow-xl overflow-hidden relative"
+                    >
+                       <div className="absolute top-0 left-0 w-full h-1 bg-blue-500 animate-pulse" />
+                       <div className="flex justify-between items-start mb-8">
+                          <div className="flex items-center gap-4">
+                             <div className="h-16 w-16 bg-blue-50 rounded-2xl flex items-center justify-center text-blue-600 relative">
+                                <PhoneOutgoing className="w-8 h-8" />
+                                <span className="absolute -top-1 -right-1 flex h-4 w-4">
+                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                                  <span className="relative inline-flex rounded-full h-4 w-4 bg-green-500"></span>
+                                </span>
+                             </div>
+                             <div>
+                                <h3 className="text-xl font-black text-gray-900 uppercase tracking-tighter">{activeCall.customer}</h3>
+                                <p className="text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] flex items-center gap-2">
+                                   <User className="w-3 h-3" /> Agente: <span className="text-blue-600">{activeCall.agent}</span>
+                                </p>
+                             </div>
+                          </div>
+                          <div className="text-right">
+                             <p className="text-3xl font-mono font-black text-gray-900">{activeCall.duration}</p>
+                             <span className="text-[9px] font-black uppercase text-gray-400 tracking-widest">{activeCall.provider}</span>
+                          </div>
+                       </div>
+
+                       {/* Waveform Visualization & Quick Actions */}
+                       <div className="bg-gray-900 rounded-3xl p-8 mb-8 relative overflow-hidden group">
+                          {supervisionMode && (
+                            <div className="absolute top-4 left-6 z-10 flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-500/20 border border-amber-500/50 text-amber-400 text-[8px] font-black uppercase tracking-widest animate-pulse">
+                              <ShieldCheck className="w-3 h-3 text-amber-400" />
+                              Supervisión Activa: Modo {supervisionMode.toUpperCase()}
+                              <button 
+                                onClick={() => setSupervisionMode(null)} 
+                                className="ml-1 text-white hover:text-red-400 underline font-mono"
+                              >
+                                [Salir]
+                              </button>
+                            </div>
+                          )}
+
+                          <div className="flex items-end justify-between gap-1 h-32 pt-6">
+                             {Array.from({ length: 40 }).map((_, i) => (
+                               <motion.div 
+                                 key={i}
+                                 animate={{ height: [10, Math.random() * 80 + 20, 10] }}
+                                 transition={{ repeat: Infinity, duration: 0.5, delay: i * 0.05 }}
+                                 className="w-full bg-blue-500 opacity-50 rounded-full"
+                               />
+                             ))}
+                          </div>
+                          <div className="absolute inset-0 flex items-center justify-center gap-3 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity">
+                             <button 
+                               onClick={() => setIsInterventionModalOpen(true)}
+                               className="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 shadow-lg transition-transform active:scale-95 cursor-pointer"
+                             >
+                                <Radio className="w-4 h-4" /> {t('voip.intervention_title', 'Intervenir Llamada (Whisper / Spy / Barge)')}
+                             </button>
+                             <button 
+                               onClick={handleHangUp}
+                               className="px-5 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 shadow-lg transition-transform active:scale-95 cursor-pointer"
+                             >
+                                <X className="w-4 h-4" /> {t('voip.end_call', 'Terminar Llamada')}
+                             </button>
+                          </div>
+                       </div>
+
+                       {/* Bottom Stats & Direct Controls */}
+                       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+                          <div className="p-4 bg-gray-50 rounded-2xl border border-gray-100">
+                             <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1">{t('voip.sentiment_ai', 'Sentimiento IA')}</p>
+                             <div className="flex items-center gap-2">
+                                <div className={`h-2 w-2 rounded-full ${activeCall.sentiment === 'positive' ? 'bg-green-500' : 'bg-red-500'}`} />
+                                <span className={`text-[10px] font-black uppercase tracking-widest ${activeCall.sentiment === 'positive' ? 'text-green-600' : 'text-red-600'}`}>
+                                   {activeCall.sentiment}
+                                </span>
+                             </div>
+                          </div>
+                          <div className="p-4 bg-gray-50 rounded-2xl border border-gray-100">
+                             <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1">{t('voip.latency', 'Latencia / Jitter')}</p>
+                             <p className="text-xs font-black text-gray-900 font-mono">{activeCall.latency || '24ms'} ({activeCall.jitter || '1.2ms'})</p>
+                          </div>
+                          <div className="p-4 bg-gray-50 rounded-2xl border border-gray-100">
+                             <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1">{t('voip.recording', 'Grabación')}</p>
+                             <div className="flex items-center gap-2 text-red-500">
+                                <div className={`h-2 w-2 rounded-full ${activeCall.isRecording ? 'bg-red-500 animate-pulse' : 'bg-gray-400'}`} />
+                                <span className="text-[10px] font-black uppercase tracking-widest">
+                                   {activeCall.isRecording ? t('voip.recording_in_progress', 'En Curso (REC)') : t('voip.recording_paused', 'Pausada')}
+                                </span>
+                             </div>
+                          </div>
+                          <div className="p-4 bg-gray-50 rounded-2xl border border-gray-100">
+                             <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1">{t('voip.accumulated_cost', 'Costo Acumulado')}</p>
+                             <p className="text-xs font-black text-green-600 font-mono">{activeCall.cost || '$0.0000'}</p>
+                          </div>
+                       </div>
+
+                       {/* Action Row for Live Call in Monitor */}
+                       <div className="flex flex-wrap items-center justify-between gap-3 p-4 bg-blue-50/50 rounded-2xl border border-blue-100">
+                          <div className="flex items-center gap-2 text-xs font-black text-blue-900 uppercase tracking-wider">
+                            <Activity className="w-4 h-4 text-blue-600 animate-spin" /> {t('voip.live_session_control', 'Control de Sesión en Vivo')}
+                          </div>
+                          <div className="flex items-center gap-2">
+                             <button
+                               onClick={() => setIsInterventionModalOpen(true)}
+                               className="px-3.5 py-1.5 bg-white hover:bg-gray-100 border border-gray-200 text-gray-700 rounded-xl text-[9px] font-black uppercase tracking-wider shadow-sm transition-all cursor-pointer"
+                             >
+                               {t('voip.supervisor_mode', 'Modo Supervisor')}
+                             </button>
+                             <button
+                               onClick={() => setIsRecording(!isRecording)}
+                               className={`px-3.5 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-wider shadow-sm transition-all flex items-center gap-1.5 cursor-pointer ${
+                                 isRecording 
+                                   ? 'bg-red-600 text-white hover:bg-red-700' 
+                                   : 'bg-white hover:bg-gray-100 border border-gray-200 text-gray-700'
+                               }`}
+                             >
+                               <span className={`w-2 h-2 rounded-full ${isRecording ? 'bg-white animate-ping' : 'bg-red-500'}`} />
+                               {isRecording ? t('voip.stop_recording', 'Detener Grabación') : t('voip.start_recording', 'Iniciar Grabación')}
+                             </button>
+                             <button
+                               onClick={handleHangUp}
+                               className="px-3.5 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-xl text-[9px] font-black uppercase tracking-wider shadow-sm transition-all cursor-pointer"
+                             >
+                               {t('voip.hangup', 'Colgar')}
+                             </button>
+                          </div>
+                       </div>
+                    </motion.div>
+                  ) : (
+                    <div className="h-full flex flex-col items-center justify-center p-20 bg-white border-2 border-dashed border-gray-200 rounded-[3rem] text-center">
+                       <Mic className="w-16 h-16 text-gray-300 mb-6" />
+                       <h3 className="text-xl font-black text-gray-400 uppercase tracking-tighter">Sin llamadas activas</h3>
+                       <p className="text-xs text-gray-400 max-w-xs mt-2 uppercase tracking-widest">El sistema está escuchando. Las llamadas se mostrarán aquí en tiempo real.</p>
+                       <button
+                         onClick={() => {
+                           triggerSoftphoneCall('Llamada Rápida', '+1 213 489 3320');
+                         }}
+                         className="mt-6 px-6 py-3 bg-gray-900 hover:bg-blue-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-md transition-all flex items-center gap-2"
+                       >
+                         <PhoneOutgoing className="w-4 h-4" /> Iniciar Llamada de Prueba VoIP
+                       </button>
+                    </div>
+                  )}
+
+                  {/* Sentiment Trend Chart */}
+                  {activeCall && (
+                    <div className="bg-white rounded-[2.5rem] p-8 border border-gray-100 shadow-xl">
+                       <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-6 flex items-center gap-2">
+                          <TrendingUp className="w-4 h-4" /> Evolución del Sentimiento (IA NLP)
+                       </h4>
+                       <div className="h-64">
+                          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 400, height: 256 }}>
+                             <AreaChart data={sentimentData}>
+                                <defs>
+                                   <linearGradient id="sentimentGradient" x1="0" y1="0" x2="0" y2="1">
+                                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8}/>
+                                      <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                                   </linearGradient>
+                                </defs>
+                                <XAxis dataKey="time" hide />
+                                <YAxis domain={[0, 100]} hide />
+                                <Tooltip 
+                                  contentStyle={{ backgroundColor: '#000', border: 'none', borderRadius: '12px', color: '#fff' }}
+                                  labelStyle={{ display: 'none' }}
+                                />
+                                <Area type="monotone" dataKey="value" stroke="#3b82f6" fillOpacity={1} fill="url(#sentimentGradient)" />
+                             </AreaChart>
+                          </ResponsiveContainer>
+                       </div>
+                    </div>
+                  )}
+               </div>
+
+               {/* Right Column: Mini Logs */}
+               <div className="lg:col-span-4 space-y-6">
+                  <div className="bg-white rounded-[2rem] border border-gray-100 shadow-xl h-full flex flex-col p-6">
+                     <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-6 flex items-center gap-2">
+                        <Clock className="w-4 h-4 text-gray-400" /> Próximas Llamadas
+                     </h4>
+                     <div className="space-y-4 flex-1">
+                        {[
+                          { time: '12:00', name: 'Miguel Rojas', type: 'Seguimiento', priority: 'High', number: '+34 690 123 456' },
+                          { time: '13:30', name: 'Ana Silva', type: 'Onboarding', priority: 'Low', number: '+54 9 11 9876 5432' },
+                          { time: '15:00', name: 'TechCorp CEO', type: 'Demos', priority: 'Critical', number: '+1 415 555 2671' },
+                        ].map((call, i) => (
+                          <div 
+                             key={i} 
+                             onClick={() => triggerSoftphoneCall(call.name, call.number)}
+                             className="p-4 bg-gray-50 rounded-2xl border border-gray-100 flex justify-between items-center group hover:border-[#00F0FF]/30 hover:shadow-sm transition-all cursor-pointer relative overflow-hidden"
+                          >
+                             {call.priority === 'Critical' && <div className="absolute top-0 right-0 h-full w-1 bg-red-500" />}
+                             <div>
+                                <p className="text-xs font-black text-gray-900 uppercase tracking-widest">{call.name}</p>
+                                <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest">{call.type}</p>
+                             </div>
+                             <div className="text-right flex items-center gap-3">
+                                <p className="text-xs font-black text-blue-600 font-mono italic">{call.time}</p>
+                                <button 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    triggerSoftphoneCall(call.name, call.number);
+                                  }}
+                                  className="px-3 py-1 bg-blue-50 hover:bg-blue-600 text-blue-600 hover:text-white rounded-lg text-[9px] font-black uppercase tracking-wider transition-all"
+                                >
+                                  Llamar
+                                </button>
+                             </div>
+                          </div>
+                        ))}
+                     </div>
+                     <button 
+                       onClick={() => navigate('/crm/pipeline')}
+                       className="w-full mt-6 py-4 bg-gray-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest hover:bg-[#00F0FF] hover:text-gray-900 transition-all shadow-xl flex items-center justify-center gap-2"
+                     >
+                        <Calendar className="w-4 h-4" /> Ir a la Agenda & Pipeline
+                     </button>
+                  </div>
+               </div>
+            </div>
+          )}
+
+          {/* BANDEJA OMNICANAL */}
+          {activeTab === 'inbox' && (
+            <div className="flex gap-6 h-[calc(100vh-16rem)] min-h-[600px]">
+               {/* Sidebar: Threads */}
+               <div className="w-full lg:w-1/3 flex flex-col gap-4 h-full">
+                  <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-xl shrink-0">
+                     <div className="relative mb-4">
+                        <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                        <input 
+                           type="text" 
+                           placeholder="Buscar conversación..."
+                           value={searchQuery}
+                           onChange={(e) => setSearchQuery(e.target.value)}
+                           className="w-full pl-10 pr-4 py-3 bg-gray-50 rounded-2xl text-[10px] font-black uppercase tracking-widest focus:ring-2 focus:ring-[#00F0FF] border-none outline-none text-gray-700"
+                        />
+                     </div>
+                     <div className="flex flex-wrap gap-1.5 items-center justify-between">
+                        <div className="flex flex-wrap gap-1">
+                           {['All', 'WhatsApp', 'Email', 'Instagram', 'Voicemail'].map(f => (
+                             <button 
+                                key={f}
+                                onClick={() => setInboxFilter(f.toLowerCase())}
+                                className={`px-2.5 py-1 rounded-full text-[8px] font-black uppercase tracking-widest border transition-all ${
+                                   inboxFilter === f.toLowerCase() ? 'bg-gray-900 text-white border-transparent' : 'bg-white text-gray-400 border-gray-100 hover:border-[#00F0FF]'
+                                }`}
+                             >
+                                {f}
+                             </button>
+                           ))}
+                        </div>
+                        <button
+                           onClick={() => {
+                             setNewCommName('');
+                             setNewCommTarget('+34690123456');
+                             setNewCommMessage('Hola, ¿cómo estás? Te escribo de parte del equipo de Kaivincia.');
+                             setNewCommChannel('WhatsApp');
+                             setShowNewCommForm(true);
+                           }}
+                           className="px-2.5 py-1 rounded-full text-[8px] font-black uppercase tracking-widest bg-[#00F0FF] text-gray-900 hover:bg-cyan-400 transition-all shadow-sm flex items-center gap-1"
+                           title="Iniciar Nueva Conversación"
+                        >
+                           <Plus className="w-3 h-3" /> Nuevo
+                        </button>
+                     </div>
+                  </div>
+
+                  <div className="bg-white rounded-[2.5rem] border border-gray-100 shadow-xl flex-1 overflow-y-auto p-4 space-y-3">
+                     {filteredThreads.length > 0 ? (
+                       filteredThreads.map(thread => (
+                         <div 
+                           key={thread.id} 
+                           onClick={() => { setSelectedThreadId(thread.id); setShowNewCommForm(false); }}
+                           className={`p-5 rounded-[2rem] transition-all cursor-pointer group relative border ${
+                              selectedThreadId === thread.id 
+                                ? 'bg-cyan-50/40 border-[#00F0FF]' 
+                                : 'bg-white border-transparent hover:bg-gray-50 hover:border-gray-100'
+                           }`}
+                         >
+                            <div className="flex justify-between items-start mb-2">
+                               <div className="flex items-center gap-3">
+                                  <div className="h-8 w-8 bg-gray-100 rounded-full flex items-center justify-center font-black text-[10px] text-gray-900">{thread.name.charAt(0)}</div>
+                                  <h5 className="text-xs font-black text-gray-900 uppercase tracking-tighter">{thread.name}</h5>
+                               </div>
+                               <span className="text-[9px] font-black text-gray-400 uppercase">{thread.time}</span>
+                            </div>
+                            <p className="text-[10px] text-gray-500 truncate mb-3 pl-11">{thread.lastMsg}</p>
+                            <div className="flex items-center justify-between pl-11">
+                               <span className={`px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-widest shadow-sm ${
+                                  thread.priority === 'High' ? 'bg-red-500 text-white' : 
+                                  thread.priority === 'Medium' ? 'bg-amber-100 text-amber-700' : 'bg-gray-100 text-gray-500'
+                               }`}>
+                                  {thread.priority}
+                               </span>
+                               <div className="flex items-center gap-1 text-[8px] font-black text-blue-600 uppercase tracking-widest">
+                                  <MessageSquare className="w-3.5 h-3.5" /> {thread.type}
+                                </div>
+                            </div>
+                         </div>
+                       ))
+                     ) : (
+                       <div className="p-8 text-center text-gray-400 text-xs font-bold uppercase">No se encontraron hilos</div>
+                     )}
+                  </div>
+               </div>
+
+               {/* Chat Content or Form */}
+               <div className="hidden lg:flex flex-1 flex-col gap-4 h-full">
+                  {showNewCommForm ? (
+                    <div className="bg-white rounded-[3rem] border border-gray-100 shadow-xl flex-1 flex flex-col p-8 overflow-y-auto">
+                       <div className="flex justify-between items-center mb-6 pb-6 border-b border-gray-100">
+                          <div>
+                             <h3 className="text-xl font-black text-gray-900 uppercase tracking-tighter italic flex items-center gap-2">
+                                <Sparkles className="w-5 h-5 text-[#00F0FF]" /> Iniciar Nueva Comunicación
+                             </h3>
+                             <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mt-1">Coloque números de WhatsApp o datos de cliente para enviar o abrir la app</p>
+                          </div>
+                          <button 
+                             type="button"
+                             onClick={() => setShowNewCommForm(false)}
+                             className="h-10 w-10 bg-gray-50 text-gray-400 hover:text-gray-900 rounded-full flex items-center justify-center transition-all"
+                          >
+                             <X className="w-5 h-5" />
+                          </button>
+                       </div>
+
+                       <form onSubmit={handleStartNewComm} className="space-y-4 max-w-xl">
+                          <div>
+                             <label className="block text-[9px] font-black uppercase tracking-widest text-gray-400 mb-1.5">Canal Oficial</label>
+                             <div className="grid grid-cols-4 gap-2">
+                                {[
+                                  { id: 'WhatsApp', icon: MessageCircle, label: 'WhatsApp', color: 'border-green-500 text-green-500 bg-green-50/50' },
+                                  { id: 'Email', icon: Mail, label: 'Email', color: 'border-indigo-500 text-indigo-500 bg-indigo-50/50' },
+                                  { id: 'Instagram', icon: Instagram, label: 'Instagram', color: 'border-pink-500 text-pink-500 bg-pink-50/50' },
+                                  { id: 'Voicemail', icon: Mic, label: 'Voicemail', color: 'border-amber-500 text-amber-500 bg-amber-50/50' },
+                                ].map(ch => {
+                                   const IconComp = ch.icon;
+                                   return (
+                                     <button
+                                        key={ch.id}
+                                        type="button"
+                                        onClick={() => {
+                                          setNewCommChannel(ch.id as any);
+                                          if (ch.id === 'WhatsApp') setNewCommTarget('+34690123456');
+                                          else if (ch.id === 'Email') setNewCommTarget('cliente@kaivincia.com');
+                                          else if (ch.id === 'Instagram') setNewCommTarget('cliente_instagram');
+                                          else if (ch.id === 'Voicemail') setNewCommTarget('+34690123456');
+                                        }}
+                                        className={`flex flex-col items-center justify-center p-3 rounded-xl border-2 transition-all ${
+                                          newCommChannel === ch.id 
+                                            ? ch.color + ' scale-105 shadow-sm' 
+                                            : 'border-gray-100 hover:border-gray-300 text-gray-400 bg-white'
+                                        }`}
+                                     >
+                                        <IconComp className="w-5 h-5 mb-1" />
+                                        <span className="text-[8px] font-black uppercase tracking-widest">{ch.label}</span>
+                                     </button>
+                                   );
+                                })}
+                             </div>
+                          </div>
+
+                          <div>
+                             <label className="block text-[9px] font-black uppercase tracking-widest text-gray-400 mb-1">Nombre Completo del Cliente</label>
+                             <input 
+                                type="text"
+                                required
+                                value={newCommName}
+                                onChange={e => setNewCommName(e.target.value)}
+                                placeholder="Ej: Zaydeli De La Rosa"
+                                className="w-full px-4 py-2.5 bg-gray-50 border border-gray-100 rounded-xl text-xs font-bold focus:ring-2 focus:ring-[#00F0FF] outline-none text-gray-700"
+                             />
+                          </div>
+
+                          <div>
+                             <label className="block text-[9px] font-black uppercase tracking-widest text-gray-400 mb-1">
+                                {newCommChannel === 'WhatsApp' && 'Número de Celular / WhatsApp'}
+                                {newCommChannel === 'Email' && 'Correo Electrónico Destino'}
+                                {newCommChannel === 'Instagram' && 'Instagram Handle / Usuario'}
+                                {newCommChannel === 'Voicemail' && 'Número de Teléfono'}
+                             </label>
+                             <input 
+                                type="text"
+                                required
+                                value={newCommTarget}
+                                onChange={e => setNewCommTarget(e.target.value)}
+                                placeholder={
+                                  newCommChannel === 'WhatsApp' ? 'Ej: +34690123456' :
+                                  newCommChannel === 'Email' ? 'Ej: cliente@domain.com' :
+                                  newCommChannel === 'Instagram' ? 'Ej: @cliente_kaivincia' : 'Ej: +34690123456'
+                                }
+                                className="w-full px-4 py-2.5 bg-gray-50 border border-gray-100 rounded-xl text-xs font-mono focus:ring-2 focus:ring-[#00F0FF] outline-none text-gray-700"
+                             />
+                          </div>
+
+                          <div>
+                             <label className="block text-[9px] font-black uppercase tracking-widest text-gray-400 mb-1">Redactar Mensaje a Enviar</label>
+                             <textarea 
+                                required
+                                rows={3}
+                                value={newCommMessage}
+                                onChange={e => setNewCommMessage(e.target.value)}
+                                placeholder="Escribe tu mensaje inicial..."
+                                className="w-full px-4 py-2.5 bg-gray-50 border border-gray-100 rounded-xl text-xs focus:ring-2 focus:ring-[#00F0FF] outline-none text-gray-700"
+                             />
+                          </div>
+
+                          <button 
+                             type="submit"
+                             className="w-full py-3 bg-gray-900 hover:bg-[#00F0FF] text-white hover:text-gray-900 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all shadow-md flex items-center justify-center gap-2"
+                          >
+                             <Send className="w-4 h-4" /> Enviar y Lanzar Canal de Comunicación
+                          </button>
+                       </form>
+                    </div>
+                  ) : (
+                    (() => {
+                      const activeThread = threads.find(t => t.id === selectedThreadId) || threads[0];
+                      if (!activeThread) return (
+                        <div className="h-full flex items-center justify-center bg-white border border-gray-100 rounded-[3rem] text-center p-12">
+                           <p className="text-gray-400 text-xs font-black uppercase tracking-widest">Seleccione una conversación</p>
+                        </div>
+                      );
+
+                      const threadMessages = messagesByThread[activeThread.id] || [];
+
+                      return (
+                        <div className="bg-white rounded-[3rem] border border-gray-100 shadow-xl flex-1 flex flex-col p-8 overflow-hidden h-full">
+                           <div className="flex justify-between items-center mb-6 pb-6 border-b border-gray-50 overflow-visible shrink-0">
+                              <div className="flex gap-4 items-center">
+                                 <div className="h-14 w-14 bg-[#00F0FF] rounded-[1.5rem] flex items-center justify-center text-white text-xl font-black italic shadow-lg rotate-3">
+                                   {activeThread.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase()}
+                                 </div>
+                                 <div>
+                                    <h5 className="text-xl font-black text-gray-900 uppercase tracking-tighter italic">{activeThread.name}</h5>
+                                    <div className="text-[9px] text-green-500 font-black uppercase tracking-[0.2em] italic flex items-center gap-2 mt-0.5">
+                                       <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" /> canal: {activeThread.type}
+                                    </div>
+                                 </div>
+                              </div>
+                              <div className="flex gap-2 items-center">
+                                 {/* Launch native apps on demand */}
+                                 {activeThread.type === 'WhatsApp' && (
+                                    <a 
+                                      href={`https://wa.me/${activeThread.phone ? activeThread.phone.replace(/[\s+]/g, '') : ''}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="h-12 px-5 flex items-center justify-center gap-2 bg-green-500 hover:bg-green-600 text-white rounded-2xl text-[9px] font-black uppercase tracking-widest transition-all hover:shadow-lg"
+                                      title="Lanzar WhatsApp Web"
+                                    >
+                                      <MessageSquare className="w-4 h-4" /> Abrir WhatsApp App
+                                    </a>
+                                 )}
+                                 {activeThread.type === 'Email' && (
+                                    <a 
+                                      href={`mailto:${activeThread.email}?subject=Contacto%20Kaivincia%20Corp`}
+                                      className="h-12 px-5 flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl text-[9px] font-black uppercase tracking-widest transition-all hover:shadow-lg"
+                                      title="Lanzar Email"
+                                    >
+                                      <Mail className="w-4 h-4" /> Abrir Correo
+                                    </a>
+                                 )}
+                                 {activeThread.type === 'Instagram' && (
+                                    <a 
+                                      href="https://instagram.com/direct/inbox/"
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="h-12 px-5 flex items-center justify-center gap-2 bg-pink-50 hover:bg-pink-100 rounded-2xl text-[9px] font-black uppercase tracking-widest transition-all hover:shadow-lg border border-pink-200"
+                                      title="Lanzar Instagram Direct"
+                                    >
+                                      <Instagram className="w-4 h-4" /> Abrir Instagram
+                                    </a>
+                                 )}
+
+                                 <button 
+                                    onClick={() => triggerSoftphoneCall(activeThread.name, activeThread.phone || '+34 690 123 456')}
+                                    className="h-12 w-12 flex items-center justify-center bg-gray-50 rounded-2xl text-gray-400 hover:text-[#00F0FF] hover:bg-gray-100 transition-all hover:shadow-md"
+                                    title="Lanzar Llamada VoIP"
+                                  >
+                                    <Phone className="w-5 h-5" />
+                                  </button>
+                                 <button className="h-12 w-12 flex items-center justify-center bg-gray-50 rounded-2xl text-gray-400 hover:text-blue-600 hover:bg-gray-100 transition-all hover:shadow-md"><MoreVertical className="w-5 h-5" /></button>
+                              </div>
+                           </div>
+
+                           <div className="flex-1 overflow-y-auto space-y-4 px-4 py-4 custom-scrollbar bg-gray-50/50 rounded-3xl border border-gray-100">
+                              {threadMessages.map(msg => (
+                                <div key={msg.id} className={`flex ${msg.role === 'customer' ? 'justify-start' : 'justify-end'}`}>
+                                   <div className={`max-w-[80%] p-5 rounded-[1.8rem] relative group shadow-sm border ${
+                                      msg.role === 'customer' 
+                                        ? 'bg-white text-gray-700 rounded-bl-none border-gray-100' 
+                                        : 'bg-gray-900 text-white rounded-br-none border-transparent'
+                                   }`}>
+                                      {msg.sentiment === 'negative' && (
+                                         <div className="absolute -top-3 -left-3 bg-red-600 text-white p-1 rounded-full shadow-lg">
+                                            <AlertCircle className="w-4 h-4" />
+                                         </div>
+                                      )}
+                                      <p className="text-xs font-medium leading-relaxed">{msg.text}</p>
+                                      <div className="flex justify-between items-center mt-3">
+                                         <p className={`text-[8px] font-black uppercase tracking-widest ${msg.role === 'customer' ? 'text-gray-400' : 'text-gray-500'}`}>
+                                            {msg.timestamp} • CANAL: {activeThread.type}
+                                         </p>
+                                         {msg.role === 'agent' && <ShieldCheck className="w-3 h-3 text-[#00F0FF]" />}
+                                      </div>
+                                   </div>
+                                </div>
+                              ))}
+                           </div>
+
+                           <div className="mt-6 pt-6 border-t border-gray-100 flex gap-4 shrink-0">
+                              <div className="relative flex-1">
+                                 <div className="absolute left-6 top-1/2 -translate-y-1/2">
+                                    <Sparkles className="w-4 h-4 text-[#00F0FF]" />
+                                 </div>
+                                 <input 
+                                    type="text" 
+                                    placeholder={`Responder por ${activeThread.type}...`}
+                                    value={chatInput}
+                                    onChange={(e) => setChatInput(e.target.value)}
+                                    onKeyDown={(e) => { if (e.key === 'Enter') handleSendChatMessage(); }}
+                                    className="w-full pl-14 pr-6 py-4 bg-gray-50 rounded-[1.8rem] text-xs font-medium border-none outline-none focus:ring-4 focus:ring-[#00F0FF]/10 transition-all text-gray-700"
+                                 />
+                              </div>
+                              <button 
+                                 onClick={handleSendChatMessage}
+                                 className="h-14 w-14 bg-gray-900 text-white rounded-2xl flex items-center justify-center hover:bg-[#00F0FF] hover:text-gray-900 transition-all shadow-md active:scale-95 group"
+                              >
+                                 <Send className="w-5 h-5 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
+                              </button>
+                            </div>
+                        </div>
+                      );
+                    })()
+                  )}
+               </div>
+            </div>
+          )}
+{/* DIRECTORIO VOIP */}
+          {activeTab === 'directory' && (
+            <div className="space-y-8">
+               {!isEditing ? (
+                <div className="bg-white rounded-[3rem] shadow-2xl border border-gray-100 overflow-hidden">
+                  <div className="p-10 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
+                    <div>
+                      <h3 className="text-xl font-black text-gray-900 uppercase tracking-tighter italic">Nodos de Interconexión</h3>
+                      <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mt-1">Gestión de Carriers y Terminación de Voz</p>
+                    </div>
+                    {isAdmin && (
+                      <button 
+                        onClick={() => openEditor()}
+                        className="bg-gray-900 text-white px-8 py-4 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-[#00F0FF] transition-all shadow-xl flex items-center gap-2"
+                      >
+                        <Plus className="h-4 w-4" /> Fusionar Nuevo Carrier
+                      </button>
+                    )}
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm text-left">
+                      <thead className="bg-white text-gray-400 font-black border-b border-gray-100 uppercase text-[9px] tracking-[0.3em]">
+                        <tr>
+                          <th className="px-10 py-6">Estructura / Nodo</th>
+                          <th className="px-10 py-6">Sincronización</th>
+                          <th className="px-10 py-6">Tarificación / Min</th>
+                          <th className="px-10 py-6">Estabilidad (24h)</th>
+                          <th className="px-10 py-6">Última Revisión</th>
+                          {isAdmin && <th className="px-10 py-6 text-right">Mantenimiento</th>}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-50">
+                        {providers.map((provider) => (
+                          <tr key={provider.id} className="hover:bg-blue-50/30 bg-white group transition-colors">
+                            <td className="px-10 py-8">
+                              <div className="font-black text-gray-900 flex items-center gap-3 uppercase tracking-tighter italic text-base">
+                                {provider.name}
+                                {provider.isDefault && <span className="bg-blue-600 text-white text-[8px] px-3 py-1 rounded-full font-black uppercase tracking-[0.2em] shadow-lg shadow-blue-200">Main Route</span>}
+                              </div>
+                              <div className="text-[10px] text-gray-400 font-black uppercase mt-1 tracking-widest">{provider.type === 'api' ? 'Backbone Engine' : 'Bridge Interface'}</div>
+                            </td>
+                            <td className="px-10 py-8">
+                               <div className="flex items-center gap-3">
+                                  <div className={`h-2.5 w-2.5 rounded-full ${provider.status === 'Activo' ? 'bg-green-500 shadow-xl shadow-green-100 animate-pulse' : 'bg-gray-200'}`} />
+                                  <span className={`text-[10px] font-black uppercase tracking-widest ${provider.status === 'Activo' ? 'text-green-600' : 'text-gray-400'}`}>
+                                    {provider.status === 'Activo' ? 'Online Peak' : 'Offline / Reserved'}
+                                  </span>
+                               </div>
+                            </td>
+                            <td className="px-10 py-8 font-mono font-black text-gray-900 text-xs italic">{provider.costPerMinute}</td>
+                            <td className="px-10 py-8">
+                               <div className="h-10 w-32 filter drop-shadow-sm">
+                                  <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 128, height: 40 }}>
+                                     <LineChart data={(provider.qualityTrend || [80, 85, 82, 90, 88, 92, 95]).map((v, i) => ({ v, i }))}>
+                                        <Line type="stepAfter" dataKey="v" stroke={provider.status === 'Activo' ? "#3b82f6" : "#cbd5e1"} strokeWidth={3} dot={false} />
+                                     </LineChart>
+                                  </ResponsiveContainer>
+                               </div>
+                            </td>
+                            <td className="px-10 py-8 text-gray-400 text-[10px] font-black font-mono uppercase tracking-widest">{new Date(provider.lastUpdated).toLocaleDateString()}</td>
+                            {isAdmin && (
+                              <td className="px-10 py-8 text-right">
+                                <button onClick={() => openEditor(provider)} className="p-3 bg-gray-50 text-gray-400 hover:text-white hover:bg-gray-900 rounded-2xl transition-all shadow-sm">
+                                  <Edit2 className="w-5 h-5" />
+                                </button>
+                              </td>
+                            )}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : (
+                 <div className="bg-white p-10 rounded-[3rem] shadow-2xl border border-gray-100 animate-in fade-in zoom-in-95 duration-300">
+                  <div className="flex justify-between items-center mb-6 border-b border-gray-100 pb-4">
+                    <h3 className="text-lg font-bold text-gray-900">Configuración de Proveedor</h3>
+                    <button onClick={() => setIsEditing(false)} className="text-gray-400 hover:text-gray-600">
+                      <X className="h-5 w-5" />
+                    </button>
+                  </div>
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Nombre del Proveedor</label>
+                      <input 
+                        type="text" 
+                        value={editingProvider?.name}
+                        onChange={(e) => setEditingProvider({...editingProvider!, name: e.target.value})}
+                        placeholder="Ej: Twilio, Vonage..."
+                        className="w-full border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Costo por Minuto (Estimado)</label>
+                      <input 
+                        type="text" 
+                        value={editingProvider?.costPerMinute}
+                        onChange={(e) => setEditingProvider({...editingProvider!, costPerMinute: e.target.value})}
+                        placeholder="Ej: $0.015"
+                        className="w-full border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Estado</label>
+                      <select 
+                        value={editingProvider?.status}
+                        onChange={(e) => setEditingProvider({...editingProvider!, status: e.target.value as any})}
+                        className="w-full border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border bg-white"
+                      >
+                        <option value="Activo">Activo</option>
+                        <option value="Inactivo">Inactivo</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Tipo de Integración</label>
+                      <select 
+                        value={editingProvider?.type}
+                        onChange={(e) => setEditingProvider({...editingProvider!, type: e.target.value as any})}
+                        className="w-full border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border bg-white"
+                      >
+                        <option value="api">API Directa (Twilio, Asterisk)</option>
+                        <option value="iframe">Webphone Iframe (Zoho, Aircall)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Dynamic Links Section */}
+                  <div className="mb-6">
+                    <div className="flex items-center justify-between mb-2">
+                      <label className="block text-sm font-medium text-gray-700">Enlaces Dinámicos (Dashboards, Webhooks)</label>
+                      <button onClick={addDynamicLink} className="text-xs text-[#00F0FF] font-medium hover:underline flex items-center gap-1">
+                        <Plus className="w-3 h-3" /> Añadir Enlace
+                      </button>
+                    </div>
+                    <div className="space-y-2">
+                      {editingProvider?.dynamicLinks?.map(link => (
+                        <div key={link.id} className="flex items-center gap-2">
+                          <input 
+                            type="text" 
+                            placeholder="Etiqueta (Ej: Billing Dashboard)"
+                            value={link.label}
+                            onChange={(e) => updateDynamicLink(link.id, 'label', e.target.value)}
+                            className="w-1/3 border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border text-sm"
+                          />
+                          <input 
+                            type="url" 
+                            placeholder="URL (Ej: https://...)"
+                            value={link.url}
+                            onChange={(e) => updateDynamicLink(link.id, 'url', e.target.value)}
+                            className="flex-1 border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border text-sm"
+                          />
+                          <button onClick={() => removeDynamicLink(link.id)} className="p-2 text-red-500 hover:bg-red-50 rounded-lg">
+                            <X className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                      {(!editingProvider?.dynamicLinks || editingProvider.dynamicLinks.length === 0) && (
+                        <p className="text-sm text-gray-500 italic">No hay enlaces configurados.</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Security Section */}
+                  <div className="bg-gray-50 p-4 rounded-lg border border-gray-200 mb-6 relative">
+                    <div className="flex items-center justify-between mb-4">
+                      <h4 className="text-sm font-bold text-gray-900 flex items-center gap-2">
+                        <Lock className="w-4 h-4 text-gray-500" /> Credenciales Técnicas
+                      </h4>
+                      {!showSecrets && (
+                        <button onClick={() => setAuthPrompt(true)} className="text-xs bg-white border border-gray-300 px-3 py-1 rounded-md shadow-sm hover:bg-gray-50 font-medium flex items-center gap-1">
+                          <Eye className="w-3 h-3" /> Mostrar Secretos
+                        </button>
+                      )}
+                      {showSecrets && (
+                        <button onClick={() => setShowSecrets(false)} className="text-xs bg-white border border-gray-300 px-3 py-1 rounded-md shadow-sm hover:bg-gray-50 font-medium flex items-center gap-1">
+                          <EyeOff className="w-3 h-3" /> Ocultar Secretos
+                        </button>
+                      )}
+                    </div>
+
+                    {editingProvider?.type === 'iframe' ? (
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">URL del Webphone (Iframe)</label>
+                        <input 
+                          type={showSecrets ? "url" : "password"}
+                          value={editingProvider.iframeUrl || ''}
+                          onChange={(e) => setEditingProvider({...editingProvider, iframeUrl: e.target.value})}
+                          placeholder="https://voice.zoho.com/webphone/..."
+                          className="w-full border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border font-mono text-sm"
+                        />
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Account ID / SID</label>
+                          <input 
+                            type={showSecrets ? "text" : "password"}
+                            value={editingProvider?.accountId || ''}
+                            onChange={(e) => setEditingProvider({...editingProvider!, accountId: e.target.value})}
+                            placeholder="••••••••••••••••"
+                            className="w-full border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border font-mono text-sm"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">API Key / Auth Token</label>
+                          <input 
+                            type={showSecrets ? "text" : "password"}
+                            value={editingProvider?.apiKey || ''}
+                            onChange={(e) => setEditingProvider({...editingProvider!, apiKey: e.target.value})}
+                            placeholder="••••••••••••••••"
+                            className="w-full border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border font-mono text-sm"
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex items-center justify-between border-t border-gray-100 pt-6">
+                    <div className="flex items-center gap-4">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input 
+                          type="checkbox" 
+                          checked={editingProvider?.isDefault}
+                          onChange={(e) => setEditingProvider({...editingProvider!, isDefault: e.target.checked})}
+                          className="rounded border-gray-300 text-[#00F0FF] focus:ring-[#00F0FF] w-5 h-5"
+                        />
+                        <span className="text-sm font-medium text-gray-900">Establecer como Proveedor Predeterminado</span>
+                      </label>
+                    </div>
+                    
+                    <div className="flex items-center gap-3">
+                      {testStatus === 'success' && <span className="text-sm text-green-600 flex items-center gap-1 font-medium"><CheckCircle2 className="w-4 h-4"/> Conexión Exitosa</span>}
+                      {testStatus === 'error' && <span className="text-sm text-red-600 flex items-center gap-1 font-medium"><AlertCircle className="w-4 h-4"/> Error de Credenciales</span>}
+                      
+                      <button 
+                        onClick={testConnection}
+                        disabled={testStatus === 'testing'}
+                        className="bg-gray-100 text-gray-700 px-4 py-2 rounded-lg font-medium hover:bg-gray-200 transition-colors text-sm"
+                      >
+                        {testStatus === 'testing' ? 'Probando...' : 'Test de Conexión'}
+                      </button>
+                      <button 
+                        onClick={handleSaveConfig}
+                        disabled={testStatus === 'testing'}
+                        className="bg-[#00F0FF] text-white px-6 py-2 rounded-lg font-medium hover:bg-[#00BFFF] flex items-center gap-2 shadow-sm"
+                      >
+                        <Save className="h-4 w-4" /> Guardar
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ENRUTAMIENTO IA */}
+          {activeTab === 'routing' && (
+            <div className="space-y-6">
+               <div className="bg-white p-8 rounded-[2.5rem] border border-gray-100 shadow-xl">
+                  <div className="flex justify-between items-start mb-10">
+                     <div>
+                        <h3 className="text-xl font-black text-gray-900 uppercase tracking-tighter italic">Lógica de Enrutamiento Inteligente</h3>
+                        <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mt-1">Configuración de flujos basados en intención y capacidad</p>
+                     </div>
+                     <button className="bg-gray-900 text-white px-6 py-3 rounded-2xl text-[10px] font-black uppercase tracking-widest flex items-center gap-2 hover:bg-blue-600 transition-all">
+                        <Plus className="w-4 h-4" /> Nueva Regla Maestro
+                     </button>
+                  </div>
+
+                  {/* Visual Drag & Drop Simulation */}
+                  <div className="relative mb-16 p-12 bg-gray-50/50 rounded-[4rem] border border-gray-100/50 overflow-hidden group">
+                     <div className="absolute inset-0 bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:24px_24px] opacity-30" />
+                     
+                     <div className="relative flex flex-col lg:flex-row items-center justify-between gap-12 lg:gap-6">
+                        {/* Source Node */}
+                        <motion.div 
+                           whileHover={{ y: -5 }}
+                           className="w-full lg:w-64 p-8 bg-white rounded-[2.5rem] shadow-2xl border border-blue-100 flex flex-col items-center relative z-10"
+                        >
+                           <div className="h-16 w-16 bg-blue-600 rounded-3xl flex items-center justify-center text-white mb-4 shadow-lg shadow-blue-200">
+                              <PhoneIncoming className="w-8 h-8" />
+                           </div>
+                           <p className="text-xs font-black uppercase tracking-widest text-gray-900 italic">Core Incoming</p>
+                           <p className="text-[9px] font-black uppercase text-blue-500 mt-1">Llamada Entrante</p>
+                           <div className="absolute -bottom-3 left-1/2 -translate-x-1/2 w-6 h-6 bg-blue-600 rounded-full border-4 border-white shadow-md cursor-pointer" />
+                        </motion.div>
+
+                        <div className="rotate-90 lg:rotate-0 flex items-center">
+                           <div className="w-16 h-1 bg-gradient-to-r from-blue-600 to-gray-900 rounded-full" />
+                           <ChevronDown className="w-6 h-6 text-gray-900 -ml-3 rotate-270 lg:rotate-270" />
+                        </div>
+
+                        {/* IA Processor Node */}
+                        <motion.div 
+                           whileHover={{ scale: 1.02 }}
+                           className="w-full lg:w-96 p-10 bg-gray-900 rounded-[3rem] shadow-[0_35px_60px_-15px_rgba(0,0,0,0.3)] flex flex-col items-center relative z-10 overflow-hidden"
+                        >
+                           <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 via-purple-500 to-blue-500 animate-gradient-x" />
+                           <div className="h-20 w-20 bg-blue-500/10 rounded-[2rem] flex items-center justify-center text-blue-400 mb-6 shadow-inner">
+                              <BrainCircuit className="w-12 h-12 animate-pulse" />
+                           </div>
+                           <h4 className="text-sm font-black text-white uppercase tracking-[0.2em] italic mb-3">Analizador de Intención IA</h4>
+                           <div className="flex flex-wrap justify-center gap-2">
+                              <span className="px-4 py-1.5 bg-blue-500/20 text-blue-400 text-[9px] font-black uppercase rounded-full border border-blue-500/30">NLP DeepSeek-V3</span>
+                              <span className="px-4 py-1.5 bg-green-500/20 text-green-400 text-[9px] font-black uppercase rounded-full border border-green-500/30">Fast-Track</span>
+                              <span className="px-4 py-1.5 bg-purple-500/20 text-purple-400 text-[9px] font-black uppercase rounded-full border border-purple-500/30">Sentiment Analysis</span>
+                           </div>
+                           <div className="absolute -bottom-3 left-1/2 -translate-x-1/2 w-6 h-6 bg-gray-900 rounded-full border-4 border-white shadow-md" />
+                           <div className="absolute -right-3 top-1/2 -translate-y-1/2 w-6 h-6 bg-gray-900 rounded-full border-4 border-white shadow-md" />
+                        </motion.div>
+
+                        <div className="rotate-90 lg:rotate-0 flex items-center">
+                           <div className="w-16 h-1 bg-gradient-to-r from-gray-900 to-[#00F0FF] rounded-full" />
+                           <ChevronDown className="w-6 h-6 text-[#00F0FF] -ml-3 rotate-270 lg:rotate-270" />
+                        </div>
+
+                        {/* Target Node */}
+                        <motion.div 
+                           whileHover={{ y: 5 }}
+                           className="w-full lg:w-72 p-8 bg-white rounded-[2.5rem] shadow-2xl border border-[#00F0FF]/20 flex flex-col items-center relative z-10"
+                        >
+                           <div className="h-16 w-16 bg-[#00F0FF]/10 rounded-3xl flex items-center justify-center text-[#00F0FF] mb-4 shadow-lg shadow-[#00F0FF]/10">
+                              <ShieldCheck className="w-8 h-8" />
+                           </div>
+                           <p className="text-xs font-black uppercase tracking-widest text-gray-900 italic">Agente Certificado X</p>
+                           <div className="mt-3 w-full bg-gray-50 rounded-full h-1 overflow-hidden">
+                              <div className="h-full bg-[#00F0FF] w-[98%]" />
+                           </div>
+                           <p className="text-[8px] font-black text-gray-400 uppercase mt-2 tracking-widest italic">Matching Accuracy: 99.4%</p>
+                        </motion.div>
+                     </div>
+
+                     {/* Connection Lines (SVGs or absolute divs) */}
+                     <div className="hidden lg:block absolute inset-0 pointer-events-none">
+                        {/* More complex SVG connections could go here */}
+                     </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                     <div className="space-y-4">
+                        <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400">Parámetros de Auditoría</h4>
+                        <div className="bg-gray-50 rounded-2xl p-6 border border-gray-100">
+                           <div className="flex items-center justify-between mb-4">
+                              <span className="text-[10px] font-black uppercase text-gray-600">Detección de Tono</span>
+                              <div className="w-12 h-6 bg-blue-600 rounded-full relative">
+                                 <div className="absolute top-1 right-1 h-4 w-4 bg-white rounded-full shadow-sm" />
+                              </div>
+                           </div>
+                           <div className="flex items-center justify-between mb-4">
+                              <span className="text-[10px] font-black uppercase text-gray-600">Extracción de Leads</span>
+                              <div className="w-12 h-6 bg-blue-600 rounded-full relative">
+                                 <div className="absolute top-1 right-1 h-4 w-4 bg-white rounded-full shadow-sm" />
+                              </div>
+                           </div>
+                           <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-black uppercase text-gray-600">Silencio Crítico (Alert)</span>
+                              <div className="w-12 h-6 bg-gray-200 rounded-full relative">
+                                 <div className="absolute top-1 left-1 h-4 w-4 bg-white rounded-full shadow-sm" />
+                              </div>
+                           </div>
+                        </div>
+                     </div>
+                     
+                     <div className="space-y-4">
+                        <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400">Distribución por Carga</h4>
+                        <div className="bg-gray-50 rounded-2xl p-6 border border-gray-100">
+                           <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-4 italic">* Balance automático basado en el Módulo de Talento (5% libre min)</p>
+                           <div className="space-y-3">
+                              {[
+                                { name: 'Ventas USA', load: 85, color: 'bg-blue-600' },
+                                { name: 'Soporte VIP', load: 30, color: 'bg-green-500' },
+                                { name: 'Onboarding', load: 55, color: 'bg-amber-500' },
+                              ].map(row => (
+                                <div key={row.name}>
+                                   <div className="flex justify-between text-[8px] font-black uppercase tracking-widest mb-1">
+                                      <span>{row.name}</span>
+                                      <span>{row.load}%</span>
+                                   </div>
+                                   <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                                      <div className={`h-full ${row.color}`} style={{ width: `${row.load}%` }} />
+                                   </div>
+                                </div>
+                              ))}
+                           </div>
+                        </div>
+                     </div>
+                  </div>
+               </div>
+            </div>
+          )}
+
+          {/* ZONAS DE COBERTURA */}
+          {activeTab === 'cobertura' && (
+            <div className="space-y-6">
+              <div className="bg-white p-8 rounded-[2.5rem] border border-gray-100 shadow-xl">
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-8">
+                  <div>
+                    <h3 className="text-xl font-black text-gray-900 uppercase tracking-tighter italic flex items-center gap-2">
+                      <MapPin className="w-6 h-6 text-blue-600" /> Zonas de Cobertura Activas (USA)
+                    </h3>
+                    <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mt-1">
+                      Monitoreo de Códigos de Área Requeridos, Zonas Horarias y Estado de Ruteo
+                    </p>
+                  </div>
+
+                  {/* Search Bar */}
+                  <div className="relative w-full md:w-80">
+                    <Search className="w-4 h-4 text-gray-400 absolute left-4 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      placeholder="Buscar por código de área o ciudad..."
+                      value={areaSearch}
+                      onChange={(e) => setAreaSearch(e.target.value)}
+                      className="w-full pl-10 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold uppercase tracking-wide focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                    />
+                  </div>
+                </div>
+
+                {/* Coverages Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {[
+                    { code: '323', city: 'Los Ángeles', state: 'California', tz: 'America/Los_Angeles', label: 'PT (Pacífico)', status: 'Ruta Óptima' },
+                    { code: '619', city: 'San Diego', state: 'California', tz: 'America/Los_Angeles', label: 'PT (Pacífico)', status: 'Ruta Óptima' },
+                    { code: '760', city: 'Oceanside / Palm Springs', state: 'California', tz: 'America/Los_Angeles', label: 'PT (Pacífico)', status: 'Ruta Óptima' },
+                    { code: '720', city: 'Denver', state: 'Colorado', tz: 'America/Denver', label: 'MT (Montaña)', status: 'Ruta Óptima' },
+                    { code: '562', city: 'Long Beach', state: 'California', tz: 'America/Los_Angeles', label: 'PT (Pacífico)', status: 'Ruta Óptima' },
+                    { code: '631', city: 'Suffolk County (Long Island)', state: 'New York', tz: 'America/New_York', label: 'ET (Este)', status: 'Ruta Óptima' },
+                    { code: '856', city: 'Camden / Cherry Hill', state: 'New Jersey', tz: 'America/New_York', label: 'ET (Este)', status: 'Ruta Óptima' },
+                    { code: '213', city: 'Los Ángeles Downtown', state: 'California', tz: 'America/Los_Angeles', label: 'PT (Pacífico)', status: 'Ruta Óptima' },
+                    { code: '909', city: 'San Bernardino', state: 'California', tz: 'America/Los_Angeles', label: 'PT (Pacífico)', status: 'Ruta Óptima' },
+                    { code: '951', city: 'Riverside', state: 'California', tz: 'America/Los_Angeles', label: 'PT (Pacífico)', status: 'Ruta Óptima' },
+                    { code: '714', city: 'Anaheim / Orange County', state: 'California', tz: 'America/Los_Angeles', label: 'PT (Pacífico)', status: 'Ruta Óptima' }
+                  ]
+                    .filter(item => 
+                      item.code.includes(areaSearch) || 
+                      item.city.toLowerCase().includes(areaSearch.toLowerCase()) || 
+                      item.state.toLowerCase().includes(areaSearch.toLowerCase())
+                    )
+                    .map((item) => {
+                      // Calculate local time for each card dynamically
+                      const localTimeStr = new Date().toLocaleTimeString('es-ES', {
+                        timeZone: item.tz,
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        hour12: true
+                      });
+                      
+                      // Check if it is standard business calling hours (9 AM - 8 PM)
+                      const localHour = parseInt(new Date().toLocaleTimeString('en-US', { timeZone: item.tz, hour: '2-digit', hour12: false }));
+                      const isSafeToCall = localHour >= 9 && localHour < 20;
+
+                      return (
+                        <motion.div
+                          key={item.code}
+                          whileHover={{ y: -4 }}
+                          className="bg-gray-50 border border-gray-100 p-6 rounded-2xl flex flex-col justify-between hover:shadow-lg transition-all"
+                        >
+                          <div>
+                            <div className="flex justify-between items-start mb-4">
+                              <span className="text-3xl font-black text-gray-900 tracking-tighter">({item.code})</span>
+                              <span className={`px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest ${
+                                isSafeToCall ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'
+                              }`}>
+                                {isSafeToCall ? 'Horario Seguro' : 'Horario No Recomendado'}
+                              </span>
+                            </div>
+                            <h4 className="text-sm font-bold text-gray-800 uppercase tracking-tight">{item.city}</h4>
+                            <p className="text-[10px] text-gray-400 font-bold uppercase tracking-wider">{item.state}</p>
+                          </div>
+
+                          <div className="mt-6 pt-4 border-t border-gray-200/60 flex justify-between items-center">
+                            <div>
+                              <p className="text-[8px] text-gray-400 font-black uppercase tracking-widest">{item.label}</p>
+                              <p className="text-xs font-black font-mono text-gray-900 mt-0.5">{localTimeStr}</p>
+                            </div>
+                            <div className="text-right">
+                              <p className="text-[8px] text-gray-400 font-black uppercase tracking-widest">Enrutador</p>
+                              <p className="text-[9px] font-black text-blue-600 uppercase tracking-tighter italic mt-0.5">{item.status}</p>
+                            </div>
+                          </div>
+                        </motion.div>
+                      );
+                    })}
+                </div>
+
+                {/* Interactive Area Code Helper */}
+                <div className="mt-10 p-8 bg-blue-50/50 rounded-3xl border border-blue-100/60 flex flex-col lg:flex-row gap-6 items-center justify-between">
+                  <div className="space-y-2 max-w-xl text-center lg:text-left">
+                    <h4 className="text-sm font-black uppercase tracking-widest text-blue-900">Validar Número de Cliente</h4>
+                    <p className="text-xs text-blue-700 leading-relaxed font-medium">
+                      Introduce el número completo del cliente para verificar si pertenece a uno de nuestros códigos de área cubiertos en California, Colorado, New York o New Jersey, calcular su zona horaria y comprobar si es una hora adecuada para llamar.
+                    </p>
+                  </div>
+                  
+                  <div className="flex gap-3 w-full lg:w-auto">
+                    <input
+                      type="text"
+                      placeholder="Ej: +1 323 555 0199"
+                      id="client-validator-input"
+                      onChange={(e) => {
+                        const val = e.target.value.replace(/\D/g, '');
+                        const outputEl = document.getElementById('validator-output');
+                        if (!outputEl) return;
+                        
+                        if (val.length < 4) {
+                          outputEl.innerHTML = '';
+                          return;
+                        }
+
+                        // Extract area code (first 3 digits after country code if +1, otherwise first 3)
+                        let code = '';
+                        if (val.startsWith('1')) {
+                          code = val.substring(1, 4);
+                        } else {
+                          code = val.substring(0, 3);
+                        }
+
+                        const map: any = {
+                          '323': { city: 'Los Ángeles, CA', tz: 'America/Los_Angeles' },
+                          '619': { city: 'San Diego, CA', tz: 'America/Los_Angeles' },
+                          '760': { city: 'Oceanside, CA', tz: 'America/Los_Angeles' },
+                          '720': { city: 'Denver, CO', tz: 'America/Denver' },
+                          '562': { city: 'Long Beach, CA', tz: 'America/Los_Angeles' },
+                          '631': { city: 'Suffolk County, NY', tz: 'America/New_York' },
+                          '856': { city: 'Camden, NJ', tz: 'America/New_York' },
+                          '213': { city: 'Los Ángeles Downtown, CA', tz: 'America/Los_Angeles' },
+                          '909': { city: 'San Bernardino, CA', tz: 'America/Los_Angeles' },
+                          '951': { city: 'Riverside, CA', tz: 'America/Los_Angeles' },
+                          '714': { city: 'Anaheim, CA', tz: 'America/Los_Angeles' }
+                        };
+
+                        if (map[code]) {
+                          const time = new Date().toLocaleTimeString('es-ES', { timeZone: map[code].tz, hour: '2-digit', minute: '2-digit', hour12: true });
+                          outputEl.innerHTML = `<span class="text-green-600 font-bold">✓ Cobertura Activa:</span> ${map[code].city} (Zona Horaria Local: ${time})`;
+                        } else {
+                          outputEl.innerHTML = `<span class="text-red-500 font-bold">✗ Código (${code || 'N/A'}):</span> Fuera de nuestra cobertura habitual de llamadas.`;
+                        }
+                      }}
+                      className="bg-white border border-blue-200 px-5 py-3 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-600/30 flex-1 lg:w-64"
+                    />
+                  </div>
+                </div>
+                <div id="validator-output" className="mt-3 text-center lg:text-left text-xs font-bold text-gray-700 px-2"></div>
+              </div>
+            </div>
+          )}
+
+          {/* SOFTPHONE & MÓVIL (PLAN DE SUPERVIVENCIA) */}
+          {activeTab === 'softphone' && (
+            <div className="space-y-6">
+              {/* Central Softphone Dialer Station */}
+              <div className="bg-slate-950 text-white p-6 sm:p-8 rounded-[2.5rem] border border-slate-800 shadow-2xl space-y-6 relative overflow-hidden">
+                <div className="absolute top-0 right-0 w-96 h-96 bg-[#00F0FF]/10 rounded-full blur-3xl pointer-events-none" />
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-slate-900 pb-6">
+                  <div>
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-10 h-10 rounded-2xl bg-[#00F0FF]/10 border border-[#00F0FF]/30 flex items-center justify-center text-[#00F0FF]">
+                        <Phone className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <h3 className="text-lg font-black text-white uppercase tracking-tight italic">
+                          {t('voip.title', 'Estación de Marcación & Softphone WebRTC')}
+                        </h3>
+                        <p className="text-xs text-slate-400 font-medium">
+                          {t('voip.subtitle', 'Discador telefónico directo con códecs G.711/OPUS, supresión de eco y conexión instantánea.')}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900 border border-slate-800 text-[10px] font-mono text-emerald-400 font-bold">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                      SIP Server: sip.zadarma.com (OK)
+                    </span>
+                    <button
+                      onClick={() => setSoftphoneOpen(true)}
+                      className="px-4 py-2 bg-[#00F0FF] text-black hover:bg-white text-xs font-black uppercase tracking-wider rounded-xl transition-all cursor-pointer shadow-lg flex items-center gap-2"
+                    >
+                      <Smartphone className="w-4 h-4" />
+                      {t('voip.open_dialer', 'Abrir Flotante')}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+                  {/* Keypad & Number Input */}
+                  <div className="lg:col-span-5 bg-slate-900/80 p-6 rounded-3xl border border-slate-800 space-y-4">
+                    {/* Carrier Selector */}
+                    <div>
+                      <label className="block text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1.5">
+                        {t('voip.carrier', 'Carrier de Voz')}
+                      </label>
+                      <select 
+                        value={selectedProviderId}
+                        onChange={e => setSelectedProviderId(e.target.value)}
+                        className="w-full bg-slate-950 text-xs font-bold text-slate-200 border border-slate-800 rounded-xl p-3 outline-none focus:border-[#00F0FF] transition-all"
+                      >
+                        {providers.map(p => (
+                          <option key={p.id} value={p.id}>{p.name} ({p.costPerMinute}/m)</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Number Display */}
+                    <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 text-center relative">
+                      <input 
+                        type="text"
+                        value={phoneNumber}
+                        onChange={e => setPhoneNumber(e.target.value)}
+                        placeholder={t('voip.dial_number', '+1 213 489 3320')}
+                        className="bg-transparent border-none text-center text-xl sm:text-2xl font-black font-mono text-white placeholder-slate-700 outline-none w-full"
+                      />
+                      {phoneNumber && (
+                        <button 
+                          onClick={() => setPhoneNumber('')}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-[9px] font-black uppercase text-slate-500 hover:text-slate-300 px-2 py-1 bg-slate-900 rounded"
+                        >
+                          Limpiar
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Dial Pad */}
+                    <div className="grid grid-cols-3 gap-2">
+                      {['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'].map(key => (
+                        <button 
+                          key={key}
+                          onClick={() => {
+                            setPhoneNumber(prev => prev + key);
+                            playDTMFTone(key);
+                          }}
+                          className="h-12 bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-white font-mono font-black rounded-xl text-lg transition-all active:scale-95 flex items-center justify-center cursor-pointer shadow-sm"
+                        >
+                          {key}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Call Actions */}
+                    <div className="flex gap-3">
+                      <button 
+                        onClick={() => {
+                          setSoftphoneOpen(true);
+                          handleDial();
+                        }}
+                        disabled={!phoneNumber}
+                        className="flex-1 py-4 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-black rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-lg flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <Phone className="w-4 h-4" /> {t('voip.call_now', 'Iniciar Llamada')}
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          setPhoneNumber('+1 213 489 3320');
+                          setSoftphoneOpen(true);
+                          handleDial('+1 213 489 3320', 'Línea Kaivincia');
+                        }}
+                        className="px-4 py-4 bg-slate-800 hover:bg-slate-700 text-white rounded-2xl font-black text-xs uppercase tracking-wider transition-all cursor-pointer"
+                        title="Probar llamada a central de prueba"
+                      >
+                        Demo Test
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Status & Supervision Overview */}
+                  <div className="lg:col-span-7 space-y-6">
+                    <div className="bg-slate-900/60 p-6 rounded-3xl border border-slate-800 space-y-4">
+                      <h4 className="text-xs font-black uppercase text-[#00F0FF] tracking-wider flex items-center gap-2">
+                        <Activity className="w-4 h-4" /> Monitoreo y Estado de Conexión Telefónica
+                      </h4>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div className="bg-slate-950 p-3 rounded-2xl border border-slate-800">
+                          <p className="text-[8px] font-black text-slate-500 uppercase">Estado Softphone</p>
+                          <p className="text-xs font-mono font-bold text-emerald-400 mt-1 uppercase">
+                            {softphoneStatus === 'idle' ? 'En Espera' : softphoneStatus}
+                          </p>
+                        </div>
+                        <div className="bg-slate-950 p-3 rounded-2xl border border-slate-800">
+                          <p className="text-[8px] font-black text-slate-500 uppercase">Latencia RTP</p>
+                          <p className="text-xs font-mono font-bold text-white mt-1">{liveLatency} ms</p>
+                        </div>
+                        <div className="bg-slate-950 p-3 rounded-2xl border border-slate-800">
+                          <p className="text-[8px] font-black text-slate-500 uppercase">Jitter de Red</p>
+                          <p className="text-xs font-mono font-bold text-white mt-1">{liveJitter} ms</p>
+                        </div>
+                        <div className="bg-slate-950 p-3 rounded-2xl border border-slate-800">
+                          <p className="text-[8px] font-black text-slate-500 uppercase">Duración</p>
+                          <p className="text-xs font-mono font-bold text-white mt-1">{formatDuration(softphoneDuration)}</p>
+                        </div>
+                      </div>
+
+                      {/* Quick contacts direct dial */}
+                      <div>
+                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-2">
+                          Marcación Rápida de Contactos Activos
+                        </p>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {[
+                            { name: 'Miguel Rojas (Lead Caliente)', number: '+34 690 123 456', tag: 'Meta Ads' },
+                            { name: 'TechCorp CEO (Cita 15:00)', number: '+1 415 555 2671', tag: 'VIP' },
+                            { name: 'Ana Silva (Seguimiento)', number: '+54 9 11 9876 5432', tag: 'Setter' },
+                            { name: 'Central Kaivincia LA', number: '+1 213 489 3320', tag: 'Soporte' },
+                          ].map((c, i) => (
+                            <div 
+                              key={i}
+                              onClick={() => {
+                                setPhoneNumber(c.number);
+                                triggerSoftphoneCall(c.name, c.number);
+                              }}
+                              className="p-3 bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-emerald-500/50 rounded-2xl flex items-center justify-between cursor-pointer transition-all group"
+                            >
+                              <div>
+                                <p className="text-xs font-black text-white group-hover:text-emerald-400 transition-colors">{c.name}</p>
+                                <p className="text-[9px] font-mono text-slate-500">{c.number}</p>
+                              </div>
+                              <span className="text-[8px] font-bold px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400 group-hover:text-white">
+                                {c.tag}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Emergency Banner */}
+              <div className="bg-gradient-to-r from-amber-500/10 to-amber-600/5 border border-amber-500/20 rounded-3xl p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                <div className="flex gap-4">
+                  <div className="h-12 w-12 rounded-2xl bg-amber-500/20 text-amber-700 flex items-center justify-center flex-shrink-0">
+                    <AlertTriangle className="w-6 h-6 animate-pulse" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-black uppercase text-amber-900 tracking-tight">Plan de Contingencia Eléctrica e Internet</h4>
+                    <p className="text-xs text-amber-800 leading-relaxed font-medium mt-0.5">
+                      Para agentes operando en Venezuela y regiones con cortes de luz: esta guía detalla cómo mantener el 100% de la operatividad telefónica usando el Softphone en el celular con un UPS de respaldo y optimización de consumo de datos móviles.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                {/* Steps Section */}
+                <div className="lg:col-span-7 space-y-6">
+                  <div className="bg-white p-8 rounded-[2.5rem] border border-gray-100 shadow-xl space-y-6">
+                    <h3 className="text-lg font-black text-gray-900 uppercase tracking-tighter italic">Pasos para Configuración de Supervivencia</h3>
+                    
+                    {/* Step 1 */}
+                    <div className="flex gap-4">
+                      <div className="h-8 w-8 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center text-xs font-black shrink-0">1</div>
+                      <div className="space-y-1">
+                        <h4 className="text-xs font-black text-gray-800 uppercase tracking-tight">Respaldo de Energía Eléctrica (UPS)</h4>
+                        <p className="text-xs text-gray-500 leading-relaxed">
+                          Conecta el módem de fibra/cable (CANTV, Netuno, Inter) y tu router principal a un **Mini-UPS de 12V** (marcas como Marsriva, Suren, etc.). Esto mantendrá el Wi-Fi activo hasta por 4 a 6 horas ininterrumpidas durante los cortes de energía.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Step 2 */}
+                    <div className="flex gap-4">
+                      <div className="h-8 w-8 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center text-xs font-black shrink-0">2</div>
+                      <div className="space-y-1">
+                        <h4 className="text-xs font-black text-gray-800 uppercase tracking-tight">Optimización de Datos Móviles (Celular)</h4>
+                        <p className="text-xs text-gray-500 leading-relaxed">
+                          Si la fibra cae por completo, utiliza tus datos móviles (Movistar o Digitel). En tu aplicación de Softphone móvil, ingresa a Ajustes de Audio y desactiva codecs de alta definición. Activa únicamente el **Codec G.729** (utiliza solo 8 Kbps de ancho de banda), esto garantiza llamadas cristalinas incluso con señal 3G/LTE inestable y ahorra 85% de tus megas de navegación.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Step 3 */}
+                    <div className="flex gap-4">
+                      <div className="h-8 w-8 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center text-xs font-black shrink-0">3</div>
+                      <div className="space-y-1">
+                        <h4 className="text-xs font-black text-gray-800 uppercase tracking-tight">Descarga del Softphone Móvil</h4>
+                        <p className="text-xs text-gray-500 leading-relaxed">
+                          Recomendamos descargar e instalar una de las siguientes aplicaciones certificadas en tu teléfono inteligente (Android o iPhone):
+                        </p>
+                        <div className="flex gap-3 mt-2 flex-wrap">
+                          <a href="https://play.google.com/store/apps/details?id=com.zadarma.phone" target="_blank" rel="noreferrer" className="px-3 py-1.5 bg-gray-100 text-gray-800 text-[9px] font-black uppercase tracking-wider rounded-xl hover:bg-blue-600 hover:text-white transition-all">Zadarma Play Store</a>
+                          <a href="https://apps.apple.com/app/zadarma/id590529598" target="_blank" rel="noreferrer" className="px-3 py-1.5 bg-gray-100 text-gray-800 text-[9px] font-black uppercase tracking-wider rounded-xl hover:bg-blue-600 hover:text-white transition-all">Zadarma App Store</a>
+                          <a href="https://www.zoiper.com/en/voip-softphone/download/zoiper-free" target="_blank" rel="noreferrer" className="px-3 py-1.5 bg-gray-100 text-gray-800 text-[9px] font-black uppercase tracking-wider rounded-xl hover:bg-blue-600 hover:text-white transition-all">Zoiper Free App</a>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Configuration Sheet / copy paste */}
+                <div className="lg:col-span-5 space-y-6">
+                  <div className="bg-slate-950 text-white p-8 rounded-[2.5rem] border border-slate-800 shadow-2xl space-y-6 relative overflow-hidden">
+                    <div className="absolute top-0 right-0 w-24 h-24 bg-blue-600/10 rounded-full blur-2xl" />
+                    <div>
+                      <span className="bg-blue-500/20 text-blue-400 text-[8px] font-black px-3 py-1 rounded-full uppercase tracking-widest">Credenciales SIP Oficiales</span>
+                      <h4 className="text-base font-black uppercase tracking-tight text-white mt-2 italic">Ficha de Conexión Zadarma</h4>
+                      <p className="text-[10px] text-slate-400 uppercase tracking-wider mt-0.5">Usa estos datos para loguearte en la app de tu celular</p>
+                    </div>
+
+                    <div className="space-y-4">
+                      {/* Host */}
+                      <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 flex justify-between items-center group">
+                        <div>
+                          <p className="text-[7px] text-slate-500 font-black uppercase tracking-widest">Servidor / SIP Host</p>
+                          <p className="text-xs font-mono font-bold text-white mt-0.5">sip.zadarma.com</p>
+                        </div>
+                        <button 
+                          onClick={() => { navigator.clipboard.writeText('sip.zadarma.com'); }}
+                          className="text-[9px] font-black uppercase text-blue-400 hover:text-white transition-colors"
+                        >
+                          Copiar
+                        </button>
+                      </div>
+
+                      {/* User */}
+                      <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 flex justify-between items-center group">
+                        <div>
+                          <p className="text-[7px] text-slate-500 font-black uppercase tracking-widest">ID de Usuario / SIP ID</p>
+                          <p className="text-xs font-mono font-bold text-white mt-0.5">jdjd.sanchez@gmail.com</p>
+                        </div>
+                        <button 
+                          onClick={() => { navigator.clipboard.writeText('jdjd.sanchez@gmail.com'); }}
+                          className="text-[9px] font-black uppercase text-blue-400 hover:text-white transition-colors"
+                        >
+                          Copiar
+                        </button>
+                      </div>
+
+                      {/* Password */}
+                      <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 flex justify-between items-center group">
+                        <div>
+                          <p className="text-[7px] text-slate-500 font-black uppercase tracking-widest">Contraseña SIP / Password</p>
+                          <p className="text-xs font-mono font-bold text-white mt-0.5">RCmt1800**</p>
+                        </div>
+                        <button 
+                          onClick={() => { navigator.clipboard.writeText('RCmt1800**'); }}
+                          className="text-[9px] font-black uppercase text-blue-400 hover:text-white transition-colors"
+                        >
+                          Copiar
+                        </button>
+                      </div>
+
+                      {/* Port & Protocol */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800">
+                          <p className="text-[7px] text-slate-500 font-black uppercase tracking-widest">Puerto SIP</p>
+                          <p className="text-xs font-mono font-bold text-white mt-0.5">5060 (UDP/TCP) o 5061 (TLS)</p>
+                        </div>
+                        <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800">
+                          <p className="text-[7px] text-slate-500 font-black uppercase tracking-widest">Protocolo de Transporte</p>
+                          <p className="text-xs font-mono font-bold text-white mt-0.5">TLS / Encriptado</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="p-4 bg-blue-500/10 border border-blue-500/20 rounded-2xl text-[10px] text-blue-300 font-bold leading-relaxed">
+                      *Nota: Asegúrate de tener activa la opción de "Mantener activo en segundo plano" en la configuración de la batería de tu celular para no perder llamadas entrantes cuando la pantalla esté apagada.
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* eSIM Provisioning & Management Suite */}
+              <div className="bg-white p-8 rounded-[2.5rem] border border-gray-100 shadow-xl space-y-6">
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-gray-100 pb-6">
+                  <div>
+                    <h3 className="text-lg font-black text-gray-900 uppercase tracking-tighter italic flex items-center gap-2">
+                      <Cpu className="w-5 h-5 text-blue-600 animate-pulse" /> Módulo de Aprovisionamiento y Control eSIM
+                    </h3>
+                    <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mt-1">
+                      Integración de Perfiles Móviles para Supervivencia y Datos de Respaldo Global
+                    </p>
+                  </div>
+                  
+                  <button
+                    onClick={() => setShowEsimProvisionForm(!showEsimProvisionForm)}
+                    className="bg-gray-900 text-white px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest flex items-center gap-2 hover:bg-blue-600 transition-all shadow-sm"
+                  >
+                    {showEsimProvisionForm ? <X className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+                    {showEsimProvisionForm ? 'Cerrar Formulario' : 'Solicitar Nueva eSIM'}
+                  </button>
+                </div>
+
+                {/* Provision Form */}
+                <AnimatePresence>
+                  {showEsimProvisionForm && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="overflow-hidden"
+                    >
+                      <form onSubmit={handleProvisionEsim} className="bg-gray-50 border border-gray-100 p-6 rounded-3xl space-y-4">
+                        <h4 className="text-xs font-black uppercase tracking-wider text-gray-700">Formulario de Pedido de eSIM para Agente</h4>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                          <div>
+                            <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Región / Destino</label>
+                            <select
+                              value={newEsimRegion}
+                              onChange={(e) => setNewEsimRegion(e.target.value)}
+                              className="w-full bg-white border border-gray-200 rounded-xl p-3 text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500/20"
+                            >
+                              <option value="USA">Estados Unidos (T-Mobile)</option>
+                              <option value="Europa">Europa Continental (Vodafone)</option>
+                              <option value="Sudamérica">Venezuela / Latam (Digitel)</option>
+                              <option value="Global">Global Roaming Multi-Carrier</option>
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Paquete de Datos</label>
+                            <select
+                              value={newEsimPackage}
+                              onChange={(e) => setNewEsimPackage(e.target.value)}
+                              className="w-full bg-white border border-gray-200 rounded-xl p-3 text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500/20"
+                            >
+                              <option value="5">5 GB High-Speed (30 días)</option>
+                              <option value="10">10 GB High-Speed (30 días)</option>
+                              <option value="15">15 GB High-Speed (30 días)</option>
+                              <option value="30">30 GB High-Speed (30 días)</option>
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Nombre del Agente Asignado</label>
+                            <input
+                              type="text"
+                              placeholder="Ej: Miguel Rojas"
+                              value={newEsimAgent}
+                              onChange={(e) => setNewEsimAgent(e.target.value)}
+                              className="w-full bg-white border border-gray-200 rounded-xl p-3 text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500/20"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="flex justify-end pt-2">
+                          <button
+                            type="submit"
+                            className="bg-blue-600 text-white px-6 py-3 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-blue-700 transition-all shadow-md flex items-center gap-2"
+                          >
+                            <Zap className="w-4 h-4" /> Generar Perfil eSIM Instantáneo
+                          </button>
+                        </div>
+                      </form>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
+                {/* eSIM Main Panel Grid */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                  {/* Left Column: List of eSIMs */}
+                  <div className="lg:col-span-5 space-y-3 max-h-[500px] overflow-y-auto pr-1">
+                    {esimProfiles.length === 0 ? (
+                      <div className="text-center py-8 text-gray-400 text-xs font-bold uppercase">No hay perfiles eSIM configurados</div>
+                    ) : (
+                      esimProfiles.map((esim) => {
+                        const isSelected = selectedEsimId === esim.id;
+                        const usagePercentage = Math.min(100, (esim.usedDataGB / esim.totalDataGB) * 100);
+                        const isAgotada = esim.status === 'Agotada';
+
+                        return (
+                          <motion.div
+                            key={esim.id}
+                            onClick={() => setSelectedEsimId(esim.id)}
+                            whileHover={{ x: 2 }}
+                            className={`p-4 rounded-2xl border transition-all cursor-pointer flex flex-col justify-between gap-3 ${
+                              isSelected 
+                                ? 'bg-blue-50/50 border-blue-400 shadow-sm' 
+                                : 'bg-gray-50 border-gray-200/60 hover:bg-gray-100/50'
+                            }`}
+                          >
+                            <div className="flex justify-between items-start">
+                              <div className="flex items-center gap-2.5">
+                                <div className={`h-9 w-9 rounded-xl flex items-center justify-center ${
+                                  isAgotada ? 'bg-red-100 text-red-600' : 'bg-blue-100 text-blue-600'
+                                }`}>
+                                  <Globe className="w-5 h-5" />
+                                </div>
+                                <div>
+                                  <h4 className="text-xs font-black text-gray-900 uppercase tracking-tight">{esim.carrier}</h4>
+                                  <p className="text-[9px] text-gray-500 font-bold uppercase tracking-wide">{esim.agentName}</p>
+                                </div>
+                              </div>
+                              <span className={`px-2.5 py-0.5 rounded-full text-[7px] font-black uppercase tracking-widest ${
+                                isAgotada ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
+                              }`}>
+                                {esim.status}
+                              </span>
+                            </div>
+
+                            <div className="space-y-1">
+                              <div className="flex justify-between text-[8px] font-black uppercase text-gray-400">
+                                <span>Consumo de Datos</span>
+                                <span className={isAgotada ? 'text-red-500' : 'text-gray-600'}>
+                                  {esim.usedDataGB.toFixed(1)} GB / {esim.totalDataGB} GB
+                                </span>
+                              </div>
+                              <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                                <div 
+                                  className={`h-full transition-all duration-500 ${isAgotada ? 'bg-red-500' : 'bg-blue-600'}`} 
+                                  style={{ width: `${usagePercentage}%` }}
+                                />
+                              </div>
+                            </div>
+
+                            <div className="flex justify-between items-center text-[9px] font-bold text-gray-500 font-mono">
+                              <span>{esim.phone}</span>
+                              <div className="flex gap-0.5">
+                                {Array.from({ length: 4 }).map((_, i) => (
+                                  <div 
+                                    key={i} 
+                                    className={`w-1 rounded-sm ${
+                                      i < esim.signalStrength 
+                                        ? (isAgotada ? 'bg-red-400' : 'bg-green-500') 
+                                        : 'bg-gray-300'
+                                    }`} 
+                                    style={{ height: `${(i + 1) * 3}px` }} 
+                                  />
+                                ))}
+                              </div>
+                            </div>
+                          </motion.div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  {/* Right Column: eSIM Details & Live Simulator */}
+                  <div className="lg:col-span-7">
+                    {(() => {
+                      const esim = esimProfiles.find(p => p.id === selectedEsimId);
+                      if (!esim) {
+                        return (
+                          <div className="bg-gray-50 border border-gray-100 rounded-3xl p-8 text-center h-full flex flex-col items-center justify-center text-gray-400 text-xs font-bold uppercase tracking-wider">
+                            Selecciona una eSIM de la lista para ver su panel de control interactivo
+                          </div>
+                        );
+                      }
+
+                      const usagePercentage = Math.min(100, (esim.usedDataGB / esim.totalDataGB) * 100);
+                      const isAgotada = esim.status === 'Agotada';
+
+                      return (
+                        <div className="bg-slate-950 text-white p-8 rounded-[2.5rem] border border-slate-800 shadow-2xl space-y-6 relative overflow-hidden h-full flex flex-col justify-between">
+                          <div className="absolute top-0 right-0 w-32 h-32 bg-blue-500/5 rounded-full blur-3xl pointer-events-none" />
+                          
+                          <div className="space-y-4">
+                            {/* Header */}
+                            <div className="flex justify-between items-start border-b border-slate-800 pb-4">
+                              <div>
+                                <span className="bg-blue-500/20 text-blue-400 text-[8px] font-black px-3 py-1 rounded-full uppercase tracking-widest">
+                                  {esim.carrier}
+                                </span>
+                                <h4 className="text-base font-black uppercase tracking-tight text-white mt-2 italic">{esim.planName}</h4>
+                                <p className="text-[10px] text-slate-400 uppercase tracking-wider mt-0.5">Asignado a: <span className="text-white font-bold">{esim.agentName}</span></p>
+                              </div>
+                              <div className="text-right">
+                                <p className="text-[7px] text-slate-500 font-black uppercase tracking-widest">Estado de Conexión</p>
+                                <span className={`inline-flex items-center gap-1.5 text-[9px] font-black uppercase tracking-widest mt-1 ${
+                                  isAgotada ? 'text-red-500' : 'text-green-400'
+                                }`}>
+                                  <span className={`h-2 w-2 rounded-full ${isAgotada ? 'bg-red-500 animate-pulse' : 'bg-green-400 animate-pulse'}`} />
+                                  {isAgotada ? 'Sin Datos' : 'Conectada (4G/5G)'}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Details Grid */}
+                            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                              <div className="bg-slate-900/60 p-3 rounded-xl border border-slate-800/50">
+                                <p className="text-[7px] text-slate-500 font-black uppercase tracking-widest">Línea Telefónica</p>
+                                <p className="text-xs font-mono font-bold text-white mt-1">{esim.phone}</p>
+                              </div>
+                              <div className="bg-slate-900/60 p-3 rounded-xl border border-slate-800/50 col-span-2 md:col-span-1">
+                                <p className="text-[7px] text-slate-500 font-black uppercase tracking-widest">ICCID de Tarjeta</p>
+                                <p className="text-[10px] font-mono font-bold text-slate-300 mt-1 truncate" title={esim.iccid}>{esim.iccid}</p>
+                              </div>
+                              <div className="bg-slate-900/60 p-3 rounded-xl border border-slate-800/50">
+                                <p className="text-[7px] text-slate-500 font-black uppercase tracking-widest">Vence el</p>
+                                <p className="text-xs font-mono font-bold text-white mt-1">{esim.expirationDate}</p>
+                              </div>
+                            </div>
+
+                            {/* Live Activation QR & Instructions */}
+                            <div className="grid grid-cols-1 md:grid-cols-12 gap-5 bg-slate-900/40 p-4 rounded-2xl border border-slate-800/40 items-center">
+                              {/* Left: Interactive SVG QR Code */}
+                              <div className="md:col-span-5 flex flex-col items-center justify-center p-2 bg-white rounded-xl shadow-inner border border-gray-300/10 group relative overflow-hidden">
+                                <svg className="w-32 h-32 text-slate-950" viewBox="0 0 100 100" fill="currentColor">
+                                  {/* QR Finder Pattern Top-Left */}
+                                  <rect x="5" y="5" width="25" height="25" fill="currentColor" />
+                                  <rect x="9" y="9" width="17" height="17" fill="white" />
+                                  <rect x="13" y="13" width="9" height="9" fill="currentColor" />
+                                  
+                                  {/* QR Finder Pattern Top-Right */}
+                                  <rect x="70" y="5" width="25" height="25" fill="currentColor" />
+                                  <rect x="74" y="9" width="17" height="17" fill="white" />
+                                  <rect x="78" y="13" width="9" height="9" fill="currentColor" />
+                                  
+                                  {/* QR Finder Pattern Bottom-Left */}
+                                  <rect x="5" y="70" width="25" height="25" fill="currentColor" />
+                                  <rect x="9" y="74" width="17" height="17" fill="white" />
+                                  <rect x="13" y="78" width="9" height="9" fill="currentColor" />
+                                  
+                                  {/* Small alignment block bottom-right */}
+                                  <rect x="78" y="78" width="5" height="5" fill="currentColor" />
+
+                                  {/* Random Simulated QR bits and patterns for realistic feel */}
+                                  <rect x="35" y="5" width="5" height="5" />
+                                  <rect x="45" y="5" width="10" height="5" />
+                                  <rect x="60" y="10" width="5" height="15" />
+                                  <rect x="35" y="15" width="15" height="5" />
+                                  <rect x="40" y="25" width="5" height="10" />
+                                  <rect x="50" y="20" width="5" height="5" />
+                                  <rect x="5" y="35" width="15" height="5" />
+                                  <rect x="25" y="35" width="5" height="15" />
+                                  <rect x="15" y="45" width="5" height="10" />
+                                  
+                                  <rect x="35" y="40" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" />
+                                  <circle cx="42.5" cy="47.5" r="2" fill="currentColor" />
+                                  
+                                  <rect x="70" y="35" width="5" height="10" />
+                                  <rect x="80" y="40" width="15" height="5" />
+                                  <rect x="75" y="50" width="10" height="15" />
+                                  <rect x="90" y="60" width="5" height="5" />
+                                  
+                                  <rect x="35" y="65" width="20" height="5" />
+                                  <rect x="45" y="75" width="10" height="10" />
+                                  <rect x="35" y="85" width="5" height="10" />
+                                  <rect x="55" y="85" width="10" height="5" />
+                                  <rect x="65" y="80" width="5" height="15" />
+                                </svg>
+                                <span className="text-[7px] text-slate-800 font-black mt-1.5 uppercase tracking-wider">Escanear para Activar</span>
+                              </div>
+
+                              {/* Right: Manual Activation Details */}
+                              <div className="md:col-span-7 space-y-2">
+                                <p className="text-[8px] text-slate-400 font-black uppercase tracking-widest flex items-center gap-1">
+                                  <QrCode className="w-3.5 h-3.5 text-blue-400" /> Manual Activation Details
+                                </p>
+                                
+                                <div className="space-y-1 text-[10px]">
+                                  <div>
+                                    <span className="text-slate-500 font-bold">SM-DP+ Server:</span>
+                                    <div className="flex justify-between items-center bg-slate-900 p-1.5 rounded-lg border border-slate-800 mt-0.5 font-mono">
+                                      <span className="text-white text-[9px] select-all">{esim.smdpServer}</span>
+                                      <button 
+                                        onClick={() => navigator.clipboard.writeText(esim.smdpServer)}
+                                        className="text-[9px] font-black uppercase text-blue-400 hover:text-white transition-colors"
+                                      >
+                                        Copiar
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  <div className="pt-1">
+                                    <span className="text-slate-500 font-bold">Código de Activación:</span>
+                                    <div className="flex justify-between items-center bg-slate-900 p-1.5 rounded-lg border border-slate-800 mt-0.5 font-mono">
+                                      <span className="text-white text-[8px] select-all truncate max-w-[150px]">{esim.activationCode}</span>
+                                      <button 
+                                        onClick={() => navigator.clipboard.writeText(esim.activationCode)}
+                                        className="text-[9px] font-black uppercase text-blue-400 hover:text-white shrink-0 ml-1 transition-colors"
+                                      >
+                                        Copiar
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Action Bar / Consumption Simulator */}
+                          <div className="pt-4 border-t border-slate-800 flex flex-col sm:flex-row gap-3">
+                            <button
+                              onClick={() => simulateDataUsage(esim.id)}
+                              disabled={isAgotada || simulatingEsimUsageId !== null}
+                              className={`flex-1 py-3 px-4 rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center justify-center gap-2 border transition-all ${
+                                isAgotada
+                                  ? 'border-slate-800 text-slate-600 cursor-not-allowed bg-transparent'
+                                  : simulatingEsimUsageId === esim.id
+                                    ? 'bg-blue-600/20 border-blue-500/30 text-blue-400 animate-pulse'
+                                    : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800 hover:text-white'
+                              }`}
+                            >
+                              <RefreshCw className={`w-3.5 h-3.5 ${simulatingEsimUsageId === esim.id ? 'animate-spin' : ''}`} />
+                              {simulatingEsimUsageId === esim.id ? 'Descargando...' : 'Simular Consumo de Datos (0.5GB)'}
+                            </button>
+
+                            <button
+                              onClick={() => handleEsimTopup(esim.id)}
+                              className="bg-blue-600 border border-blue-500 hover:bg-blue-500 text-white py-3 px-5 rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center justify-center gap-2 transition-all shadow-md shadow-blue-500/10"
+                            >
+                              <Zap className="w-3.5 h-3.5" />
+                              Recargar Datos (Top-up Plan)
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* VALIDADOR ZOHO (BILL BUILDER) */}
+          {activeTab === 'utilidades' && (
+            <div className="space-y-6">
+              {/* Embed helper CSS for print-preview only */}
+              <style>{`
+                @media print {
+                  body * {
+                    visibility: hidden;
+                  }
+                  #utility-bill-print, #utility-bill-print * {
+                    visibility: visible;
+                  }
+                  #utility-bill-print {
+                    position: absolute;
+                    left: 0;
+                    top: 0;
+                    width: 210mm;
+                    height: 297mm;
+                    padding: 15mm;
+                    background: white !important;
+                    color: black !important;
+                    border: none !important;
+                    box-shadow: none !important;
+                  }
+                }
+              `}</style>
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+                {/* Form Editor */}
+                <div className="lg:col-span-5 bg-white p-8 rounded-[2.5rem] border border-gray-100 shadow-xl space-y-6">
+                  <div>
+                    <h3 className="text-lg font-black text-gray-900 uppercase tracking-tighter italic">Formateador de Dirección US (Zoho)</h3>
+                    <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mt-1">Genera y Modifica un Comprobante para Validar Rutas de Zoho</p>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Nombre del Titular</label>
+                      <input 
+                        type="text" 
+                        value={billName}
+                        onChange={e => setBillName(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs font-bold focus:ring-2 focus:ring-blue-500/20 outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Nombre de la Empresa (C/O)</label>
+                      <input 
+                        type="text" 
+                        value={billCompany}
+                        onChange={e => setBillCompany(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs font-bold focus:ring-2 focus:ring-blue-500/20 outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Dirección en California, USA</label>
+                      <input 
+                        type="text" 
+                        value={billAddress}
+                        onChange={e => setBillAddress(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs font-bold focus:ring-2 focus:ring-blue-500/20 outline-none"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Nro de Cuenta</label>
+                        <input 
+                          type="text" 
+                          value={billAccount}
+                          onChange={e => setBillAccount(e.target.value)}
+                          className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs font-bold focus:ring-2 focus:ring-blue-500/20 outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Monto de Consumo ($)</label>
+                        <input 
+                          type="text" 
+                          value={billAmount}
+                          onChange={e => setBillAmount(e.target.value)}
+                          className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs font-bold focus:ring-2 focus:ring-blue-500/20 outline-none"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Fecha de Facturación</label>
+                        <input 
+                          type="date" 
+                          value={billDate}
+                          onChange={e => setBillDate(e.target.value)}
+                          className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs font-bold focus:ring-2 focus:ring-blue-500/20 outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Fecha de Vencimiento</label>
+                        <input 
+                          type="date" 
+                          value={billDueDate}
+                          onChange={e => setBillDueDate(e.target.value)}
+                          className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs font-bold focus:ring-2 focus:ring-blue-500/20 outline-none"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="pt-4 flex gap-3">
+                    <button 
+                      onClick={() => window.print()}
+                      className="w-full py-4 bg-gray-900 text-white text-xs font-black uppercase tracking-widest rounded-2xl hover:bg-blue-600 transition-all flex items-center justify-center gap-2 shadow-xl"
+                    >
+                      <Download className="w-4 h-4" /> Descargar PDF / Imprimir
+                    </button>
+                  </div>
+
+                  <div className="p-4 bg-blue-50 rounded-2xl border border-blue-100/60 text-[10px] text-blue-700 leading-relaxed font-bold">
+                    💡 **Instrucciones para Zoho**: Para cambiar el titular de la factura de California de tu amigo por el tuyo, simplemente edita el "Nombre del Titular" arriba, haz clic en "Descargar PDF / Imprimir" y en la ventana de impresión del navegador selecciona la opción **"Guardar como PDF"**. Sube ese archivo PDF generado a Zoho Voice para pasar la verificación de dirección sin demoras.
+                  </div>
+                </div>
+
+                {/* Printable utility bill preview mock */}
+                <div className="lg:col-span-7 bg-gray-200 p-8 rounded-[2.5rem] border border-gray-300 flex justify-center shadow-inner overflow-x-auto">
+                  <div 
+                    id="utility-bill-print"
+                    className="w-[595px] h-[842px] bg-white text-black p-8 shadow-2xl font-sans border border-gray-300 flex flex-col justify-between"
+                    style={{ minWidth: '595px' }}
+                  >
+                    <div>
+                      {/* Logo & Header */}
+                      <div className="flex justify-between items-start border-b-2 border-orange-500 pb-4">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <div className="h-8 w-8 bg-gradient-to-br from-orange-500 to-amber-400 rounded-lg flex items-center justify-center text-white font-black text-sm">P</div>
+                            <span className="text-sm font-black tracking-wider text-gray-800 font-mono">PACIFIC ENERGY</span>
+                          </div>
+                          <p className="text-[7px] text-gray-500 mt-0.5">Pacific Gas & Electric Utilities Co.</p>
+                          <p className="text-[7px] text-gray-500">77 Beale St, San Francisco, CA 94105</p>
+                        </div>
+                        <div className="text-right">
+                          <h4 className="text-xs font-black uppercase text-orange-600 tracking-wider">Electric Utility Bill</h4>
+                          <p className="text-[8px] font-mono mt-1"><span className="font-bold">Account:</span> {billAccount}</p>
+                          <p className="text-[8px] font-mono"><span className="font-bold">Statement Date:</span> {billDate}</p>
+                        </div>
+                      </div>
+
+                      {/* Billing Address Block */}
+                      <div className="mt-6 grid grid-cols-2 gap-8 bg-gray-50 p-4 rounded-xl border border-gray-200">
+                        <div>
+                          <p className="text-[7px] font-bold uppercase text-gray-400">Customer Details</p>
+                          <p className="text-xs font-black text-gray-800 mt-1 uppercase">{billName}</p>
+                          {billCompany && <p className="text-[9px] font-bold text-gray-600 uppercase">{billCompany}</p>}
+                          <p className="text-[9px] font-medium text-gray-500 mt-1 uppercase leading-tight">{billAddress}</p>
+                        </div>
+                        <div className="text-right flex flex-col justify-between">
+                          <div>
+                            <p className="text-[7px] font-bold uppercase text-gray-400">Total Amount Due</p>
+                            <p className="text-xl font-black text-orange-600 mt-0.5">${billAmount}</p>
+                          </div>
+                          <p className="text-[8px] font-mono"><span className="font-bold">Due Date:</span> {billDueDate}</p>
+                        </div>
+                      </div>
+
+                      {/* Detailed Electric Charges */}
+                      <div className="mt-8">
+                        <h5 className="text-[8px] font-black uppercase tracking-widest text-gray-400 mb-2">Detail of Current Charges</h5>
+                        <table className="w-full text-[9px]">
+                          <thead>
+                            <tr className="border-b border-gray-300 text-gray-400 font-bold uppercase text-[7px]">
+                              <th className="py-2 text-left">Description</th>
+                              <th className="py-2 text-right">Usage</th>
+                              <th className="py-2 text-right">Rate ($)</th>
+                              <th className="py-2 text-right">Amount</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-100">
+                            <tr>
+                              <td className="py-2 text-gray-700 font-medium">Generation Service (Baseline Allowance)</td>
+                              <td className="py-2 text-right font-mono">420 kWh</td>
+                              <td className="py-2 text-right font-mono">$0.185</td>
+                              <td className="py-2 text-right font-mono">${(420 * 0.185).toFixed(2)}</td>
+                            </tr>
+                            <tr>
+                              <td className="py-2 text-gray-700 font-medium">Transmission & Distribution (Over Baseline)</td>
+                              <td className="py-2 text-right font-mono">180 kWh</td>
+                              <td className="py-2 text-right font-mono">$0.215</td>
+                              <td className="py-2 text-right font-mono">${(180 * 0.215).toFixed(2)}</td>
+                            </tr>
+                            <tr>
+                              <td className="py-2 text-gray-700 font-medium">Public Purpose Programs Surcharge</td>
+                              <td className="py-2 text-right font-mono">-</td>
+                              <td className="py-2 text-right font-mono">-</td>
+                              <td className="py-2 text-right font-mono">$12.45</td>
+                            </tr>
+                            <tr>
+                              <td className="py-2 text-gray-700 font-medium">State Regulatory / Local Franchise Fees</td>
+                              <td className="py-2 text-right font-mono">-</td>
+                              <td className="py-2 text-right font-mono">-</td>
+                              <td className="py-2 text-right font-mono">$21.32</td>
+                            </tr>
+                            <tr className="border-t-2 border-gray-300 font-black text-gray-800 text-[10px]">
+                              <td className="py-2 text-left uppercase">Total Current Utility Charges</td>
+                              <td className="py-2 text-right font-mono">600 kWh</td>
+                              <td className="py-2 text-right">-</td>
+                              <td className="py-2 text-right font-mono text-orange-600">${billAmount}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+
+                      {/* Bar chart mockup */}
+                      <div className="mt-8 bg-gray-50 p-4 rounded-xl border border-gray-200">
+                        <p className="text-[7px] font-bold uppercase text-gray-400 mb-2">Daily Electric Usage History (kWh/day)</p>
+                        <div className="h-16 flex items-end justify-between px-2 gap-1.5">
+                          {[12, 15, 18, 14, 19, 21, 23, 22, 17, 19, 24, 20].map((h, i) => (
+                            <div key={i} className="flex-1 bg-orange-200 rounded-t h-full flex flex-col justify-end" style={{ height: `${h * 4}%` }}>
+                              <div className="bg-orange-500 rounded-t" style={{ height: '70%' }} />
+                            </div>
+                          ))}
+                        </div>
+                        <div className="flex justify-between text-[6px] text-gray-400 uppercase font-black tracking-widest mt-2">
+                          <span>Jul 25</span>
+                          <span>Nov 25</span>
+                          <span>Mar 26</span>
+                          <span>Jun 26 (Current)</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Tear-off payment slip */}
+                    <div className="border-t-2 border-dashed border-gray-300 pt-6">
+                      <div className="flex justify-between items-center">
+                        <div>
+                          <p className="text-[6px] text-gray-400 uppercase font-black tracking-widest">Tear-Off Remittance Slip</p>
+                          <p className="text-[7px] font-bold text-gray-600">Please send this portion with your check payment made payable to Pacific Energy</p>
+                        </div>
+                        <div className="text-right">
+                          <span className="bg-green-100 text-green-800 text-[6px] font-black px-2 py-0.5 rounded border border-green-200 uppercase tracking-widest">VERIFIED FOR ZOHO ROUTING</span>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 flex justify-between text-[8px] font-mono">
+                        <div>
+                          <p className="font-bold uppercase text-gray-500">Bill Account Number</p>
+                          <p className="text-xs font-black mt-0.5">{billAccount}</p>
+                        </div>
+                        <div>
+                          <p className="font-bold uppercase text-gray-500">Payment Due Date</p>
+                          <p className="text-xs font-black mt-0.5">{billDueDate}</p>
+                        </div>
+                        <div>
+                          <p className="font-bold uppercase text-gray-500">Amount Due</p>
+                          <p className="text-xs font-black mt-0.5 text-orange-600">${billAmount}</p>
+                        </div>
+                      </div>
+
+                      {/* Barcode */}
+                      <div className="mt-4 flex justify-center">
+                        <div className="h-6 bg-gray-900 w-64 flex items-center justify-around px-2 relative opacity-85">
+                          <div className="absolute inset-0 bg-white/25 flex items-center justify-center text-[7px] tracking-[0.6em] font-mono font-black text-black select-none">
+                            *{billAccount.replace(/-/g, '')}*
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* REGISTRO DE LLAMADAS + TRANSCRIPCIÓN IA */}
+          {activeTab === 'logs' && (
+            <div className="space-y-6">
+               {!selectedLog ? (
+                <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+                  <div className="p-6 border-b border-gray-200 flex justify-between items-center">
+                    <div>
+                      <h3 className="text-lg font-bold text-gray-900">Auditoría de Llamadas</h3>
+                      <p className="text-sm text-gray-500 mt-1">Registro inmutable de interacciones entre Agentes y Clientes/Alumnos.</p>
+                    </div>
+                    <div className="flex gap-2">
+                       <button className="px-4 py-2 bg-gray-900 text-white rounded-xl text-[10px] font-black uppercase tracking-widest flex items-center gap-2">
+                          <BarChart2 className="w-4 h-4" /> Exportar Reporte
+                       </button>
+                    </div>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm text-left">
+                      <thead className="bg-gray-50 text-gray-500 font-medium border-b border-gray-200 uppercase text-[10px] font-black tracking-widest">
+                        <tr>
+                          <th className="px-6 py-4">Status</th>
+                          <th className="px-6 py-4">Agente</th>
+                          <th className="px-6 py-4">Destino</th>
+                          <th className="px-6 py-4">Duración</th>
+                          <th className="px-6 py-4">Sentimiento</th>
+                          <th className="px-6 py-4 text-right">Transcripción</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100 bg-white">
+                        {[
+                          { id: '1', date: 'Hoy, 10:30 AM', agent: 'Marta García', target: 'Juan Pérez (CEO)', duration: '02:45', provider: 'Twilio', status: 'Success', sentiment: 'Positive' },
+                          { id: '2', date: 'Ayer, 15:45 PM', agent: 'Carlos Ruiz', target: 'TechSolutions Inc.', duration: '12:10', provider: 'Zoho Voice', status: 'Success', sentiment: 'Neutral' },
+                          { id: '3', date: 'Ayer, 09:20 AM', agent: 'Ana Silva', target: 'Miguel Rojas', duration: '05:00', provider: 'Twilio', status: 'Failed', sentiment: 'N/A' },
+                        ].map((log, i) => (
+                          <tr key={i} className="hover:bg-blue-50/50 transition-colors cursor-pointer group" onClick={() => setSelectedLog(log)}>
+                            <td className="px-6 py-4">
+                               <div className={`h-2 w-2 rounded-full ${log.status === 'Success' ? 'bg-green-500' : 'bg-red-500'}`} />
+                            </td>
+                            <td className="px-6 py-4">
+                               <p className="font-black text-gray-900 uppercase text-[11px] tracking-tighter">{log.agent}</p>
+                               <p className="text-[10px] text-gray-400 font-bold">{log.date}</p>
+                            </td>
+                            <td className="px-6 py-4 text-xs font-bold text-gray-600 uppercase tracking-tighter">{log.target}</td>
+                            <td className="px-6 py-4 font-mono text-[11px] text-gray-900">{log.duration}</td>
+                            <td className="px-6 py-4">
+                               <span className={`text-[10px] font-black uppercase tracking-widest ${log.sentiment === 'Positive' ? 'text-green-600' : 'text-gray-400'}`}>
+                                  {log.sentiment}
+                               </span>
+                            </td>
+                            <td className="px-6 py-4 text-right">
+                              <button className="text-blue-600 hover:text-blue-800 flex items-center justify-end gap-1 w-full text-[10px] font-black uppercase tracking-widest bg-blue-50 px-3 py-1.5 rounded-xl group-hover:bg-blue-100 transition-all">
+                                <Sparkles className="w-3 h-3" /> Ver Análisis IA
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+               ) : (
+                 <motion.div 
+                   initial={{ opacity: 0, y: 20 }}
+                   animate={{ opacity: 1, y: 0 }}
+                   className="space-y-6"
+                 >
+                    <button 
+                       onClick={() => setSelectedLog(null)}
+                       className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-[#00F0FF] hover:text-gray-900"
+                    >
+                       <ChevronUp className="w-4 h-4 rotate-270" /> Volver al Registro
+                    </button>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                       {/* Transcription Column */}
+                       <div className="lg:col-span-8">
+                          <div className="bg-white/70 backdrop-blur-xl border border-white/40 rounded-[2.5rem] shadow-2xl p-8 h-full flex flex-col">
+                             <div className="flex justify-between items-center mb-8 pb-6 border-b border-gray-100">
+                                <div>
+                                   <h3 className="text-2xl font-black text-gray-900 uppercase tracking-tighter italic">Análisis de Transcripción</h3>
+                                   <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">ID: {selectedLog.id} • {selectedLog.date}</p>
+                                </div>
+                                <div className="flex gap-3">
+                                   <button className="h-12 w-12 bg-gray-50 rounded-2xl flex items-center justify-center text-gray-400 hover:bg-blue-50 hover:text-blue-600 transition-all">
+                                      <PlayCircle className="w-6 h-6" />
+                                   </button>
+                                   <button className="px-6 bg-gray-900 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-blue-600 transition-all">
+                                      Guardar Reporte
+                                   </button>
+                                </div>
+                             </div>
+
+                             <div className="flex-1 space-y-8 overflow-y-auto pr-4 mb-2">
+                                {transcription.map((msg, i) => (
+                                  <div key={msg.id} className={`flex gap-4 ${msg.role === 'customer' ? 'flex-row' : 'flex-row-reverse'}`}>
+                                     <div className={`h-8 w-8 rounded-full flex-shrink-0 flex items-center justify-center text-white text-[10px] font-black ${msg.role === 'customer' ? 'bg-gray-400' : 'bg-[#00F0FF]'}`}>
+                                        {msg.sender.charAt(0)}
+                                     </div>
+                                     <div className={`max-w-[70%] group`}>
+                                        <div className={`p-5 rounded-[2rem] border relative ${
+                                          msg.role === 'customer' ? 'bg-white border-gray-100 rounded-tl-none' : 'bg-blue-600 text-white border-blue-500 shadow-lg rounded-tr-none'
+                                        }`}>
+                                           <div className="flex justify-between items-center mb-2">
+                                              <span className="text-[9px] font-black uppercase tracking-widest opacity-60">{msg.sender}</span>
+                                              <span className="text-[9px] font-black uppercase tracking-widest opacity-60">{msg.timestamp}</span>
+                                           </div>
+                                           <p className="text-xs font-medium leading-relaxed">{msg.text}</p>
+                                           <button className="absolute -right-10 top-0 opacity-0 group-hover:opacity-100 transition-opacity p-2 text-[#00F0FF] hover:scale-125">
+                                              <Zap className="w-4 h-4 fill-current" />
+                                           </button>
+                                        </div>
+                                     </div>
+                                  </div>
+                                ))}
+                             </div>
+
+                             {/* Audio Player UX */}
+                             <div className="bg-gray-900/5 backdrop-blur-md rounded-3xl p-4 mt-6 flex items-center gap-6 border border-gray-100">
+                                <button className="h-10 w-10 bg-gray-900 text-white rounded-full flex items-center justify-center shadow-lg"><PlayCircle className="w-5 h-5" /></button>
+                                <div className="flex-1 h-1 bg-gray-200 rounded-full overflow-hidden relative">
+                                   <div className="absolute inset-0 bg-blue-600 w-1/3" />
+                                </div>
+                                <span className="text-[10px] font-black text-gray-400 font-mono">01:12 / 02:45</span>
+                             </div>
+                          </div>
+                       </div>
+
+                       {/* Insights Column */}
+                       <div className="lg:col-span-4 space-y-6">
+                          {/* Sentiment Widget */}
+                          <div className="bg-white rounded-[2rem] p-6 border border-gray-100 shadow-xl overflow-hidden relative">
+                             <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-6 flex items-center gap-2">
+                                <Activity className="w-4 h-4" /> Humor del Cliente
+                             </h4>
+                             <div className="flex items-center gap-4 mb-4">
+                                <div className="flex-1 h-3 bg-gradient-to-r from-red-500 via-cyan-500/100 to-green-500 rounded-full relative">
+                                   <motion.div 
+                                      initial={{ left: '0%' }}
+                                      animate={{ left: '85%' }}
+                                      className="absolute top-1/2 -translate-y-1/2 w-5 h-5 bg-white border-2 border-gray-900 rounded-full shadow-lg"
+                                   />
+                                </div>
+                                <span className="text-xs font-black text-green-600 uppercase italic">Éxito</span>
+                             </div>
+                             <p className="text-[10px] text-gray-400 italic">El cliente comenzó escéptico pero cerró con un sentimiento de alta confianza.</p>
+                          </div>
+
+                          {/* Action Items */}
+                          <div className="bg-white rounded-[2rem] p-6 border border-gray-100 shadow-xl">
+                             <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-6 flex items-center gap-2">
+                                <ListTodo className="w-4 h-4" /> Compromisos Pactados
+                             </h4>
+                             <div className="space-y-4">
+                                {actionItems.map(item => (
+                                  <div key={item.id} className="p-4 bg-gray-50 border border-gray-100 rounded-2xl relative overflow-hidden group">
+                                     <div className="flex justify-between items-start mb-2">
+                                        <span className={`px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-widest ${
+                                          item.type === 'email' ? 'bg-blue-100 text-blue-600' : 'bg-purple-100 text-purple-600'
+                                        }`}>
+                                           {item.type}
+                                        </span>
+                                        <span className="text-[9px] font-bold text-red-500">{item.dueDate}</span>
+                                     </div>
+                                     <p className="text-[11px] font-black text-gray-700 leading-tight mb-4">{item.text}</p>
+                                     <button className="w-full py-2 bg-gray-900 text-white rounded-xl text-[9px] font-black uppercase tracking-widest hover:bg-blue-600 transition-all flex items-center justify-center gap-2 shadow-lg group-hover:scale-105">
+                                        <Zap className="w-3 h-3" /> Convertir en Tarea
+                                     </button>
+                                  </div>
+                                ))}
+                             </div>
+                          </div>
+
+                          {/* NLP Tags */}
+                          <div className="bg-white rounded-[2rem] p-6 border border-gray-100 shadow-xl">
+                             <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-4">Keywords Detectadas</h4>
+                             <div className="flex flex-wrap gap-2">
+                                {['Presupuesto', 'Plan Anual', '15% Off', 'Mañana', 'Reunión', 'Onboarding'].map(tag => (
+                                  <span key={tag} className="px-3 py-1 bg-gray-50 rounded-lg text-[9px] font-bold text-gray-500 uppercase tracking-widest border border-gray-100">{tag}</span>
+                                ))}
+                             </div>
+                          </div>
+                       </div>
+                    </div>
+                 </motion.div>
+               )}
+            </div>
+          )}
+
+        </div>
+      </div>
+
+      {/* Auth Prompt Modal */}
+      {authPrompt && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm flex flex-col p-6">
+            <div className="flex items-center justify-center w-12 h-12 bg-red-100 text-red-600 rounded-full mx-auto mb-4">
+              <Lock className="w-6 h-6" />
+            </div>
+            <h3 className="text-xl font-bold text-gray-900 text-center mb-2">Re-Autenticación Requerida</h3>
+            <p className="text-sm text-gray-500 text-center mb-6">Para ver las credenciales de la API, ingresa tu contraseña de SuperAdmin.</p>
+            
+            <form onSubmit={handleAuthSubmit}>
+              <input 
+                type="password" 
+                value={authPassword}
+                onChange={e => setAuthPassword(e.target.value)}
+                placeholder="Contraseña (simulación: admin123)"
+                className="w-full border-gray-300 rounded-lg shadow-sm focus:ring-[#00F0FF] focus:border-[#00F0FF] p-2 border mb-4"
+                autoFocus
+              />
+              <div className="flex gap-3">
+                <button 
+                  type="button"
+                  onClick={() => { setAuthPrompt(false); setAuthPassword(''); }}
+                  className="flex-1 px-4 py-2 text-gray-700 bg-gray-100 rounded-lg font-medium hover:bg-gray-200"
+                >
+                  Cancelar
+                </button>
+                <button 
+                  type="submit"
+                  className="flex-1 px-4 py-2 bg-[#00F0FF] text-white rounded-lg font-medium hover:bg-[#00BFFF]"
+                >
+                  Verificar
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Softphone Toggle */}
+      <div className="fixed bottom-8 right-8 z-[90]">
+         <motion.button
+           whileHover={{ scale: 1.05 }}
+           whileTap={{ scale: 0.95 }}
+           onClick={() => setSoftphoneOpen(!softphoneOpen)}
+           className="flex items-center gap-3 px-6 py-4 bg-gray-900 text-white rounded-full border border-gray-800 shadow-[0_0_25px_rgba(0,240,255,0.25)] hover:border-[#00F0FF]/50 transition-all font-black text-xs uppercase tracking-widest"
+         >
+           <span className="relative flex h-3 w-3">
+             {softphoneStatus === 'connected' ? (
+               <>
+                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                 <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+               </>
+             ) : (
+               <>
+                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                 <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
+               </>
+             )}
+           </span>
+           <Phone className="w-4 h-4" />
+           {softphoneStatus === 'connected' ? 'En Llamada...' : 'Softphone'}
+         </motion.button>
+      </div>
+
+      {/* Softphone Dialer Drawer */}
+      <AnimatePresence>
+        {softphoneOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: 100, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 100, scale: 0.95 }}
+            className="fixed bottom-28 right-8 z-[90] w-80 bg-slate-950/95 backdrop-blur-xl border border-slate-800 rounded-[2.5rem] overflow-hidden shadow-[0_0_50px_rgba(0,240,255,0.3)] flex flex-col text-white"
+          >
+             {/* Softphone Header */}
+             <div className="p-5 border-b border-slate-900 bg-gradient-to-r from-slate-900 to-transparent flex justify-between items-center">
+                <div className="flex items-center gap-2">
+                   <Phone className="w-5 h-5 text-[#00F0FF]" />
+                   <div>
+                      <h4 className="text-xs font-black text-white italic tracking-tighter uppercase">Kaivincia Softphone</h4>
+                      <p className="text-[8px] font-mono text-slate-500 uppercase tracking-widest">
+                        {softphoneStatus === 'idle' ? 'Listo / Sip OK' : 
+                         softphoneStatus === 'calling' ? 'Estableciendo canal...' : 
+                         softphoneStatus === 'connected' ? 'Llamada Conectada' : 'Llamada Finalizada'}
+                      </p>
+                   </div>
+                </div>
+                <button onClick={() => setSoftphoneOpen(false)} className="p-2 hover:bg-white/5 rounded-full text-slate-400 hover:text-white transition-colors">
+                   <X className="w-4 h-4" />
+                </button>
+             </div>
+
+             {/* Screen / Display */}
+             <div className="p-5 bg-slate-950 border-b border-slate-900 text-center relative min-h-[90px] flex flex-col justify-center">
+                {softphoneStatus === 'idle' ? (
+                  <>
+                     <input 
+                       type="text"
+                       value={phoneNumber}
+                       onChange={e => setPhoneNumber(e.target.value)}
+                       placeholder="Ingresar número..."
+                       className="bg-transparent border-none text-center text-xl font-black font-mono text-white placeholder-slate-800 outline-none w-full"
+                     />
+                     {phoneNumber && (
+                       <button 
+                         onClick={() => setPhoneNumber('')}
+                         className="absolute right-4 top-1/2 -translate-y-1/2 text-[9px] font-black uppercase text-slate-500 hover:text-slate-300"
+                       >
+                         Limpiar
+                       </button>
+                     )}
+                  </>
+                ) : (
+                  <div className="space-y-1">
+                     <p className="text-xs font-mono text-slate-400">{phoneNumber || 'Número Privado'}</p>
+                     <p className="text-lg font-black text-white italic uppercase tracking-widest animate-pulse">
+                       {softphoneStatus === 'calling' ? (connectionStage || 'Marcando...') : 
+                        softphoneStatus === 'connected' ? 'Llamada Activa' : 'Colgando...'}
+                     </p>
+                     {softphoneStatus === 'calling' && (
+                       <div className="flex items-center justify-center gap-2 mt-2">
+                         <button
+                           onClick={() => forceConnectNow()}
+                           className="px-3 py-1 bg-green-500/20 hover:bg-green-500/30 border border-green-500/50 text-green-400 rounded-full text-[8px] font-black uppercase tracking-widest transition-all"
+                         >
+                           ⚡ Conectar Ahora
+                         </button>
+                         <button
+                           onClick={handleHangUp}
+                           className="px-3 py-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 text-red-400 rounded-full text-[8px] font-black uppercase tracking-widest transition-all"
+                         >
+                           Cancelar
+                         </button>
+                       </div>
+                     )}
+                     {softphoneStatus === 'connected' && (
+                       <p className="text-sm font-mono font-black text-[#00F0FF]">{formatDuration(softphoneDuration)}</p>
+                     )}
+                  </div>
+                )}
+             </div>
+
+             {/* Tabs / Subsections */}
+             {softphoneStatus === 'idle' && (
+               <div className="p-5 space-y-4">
+                  {/* Carrier Selection */}
+                  <div>
+                     <label className="block text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1">Carrier de Voz (Enrutador)</label>
+                     <select 
+                       value={selectedProviderId}
+                       onChange={e => setSelectedProviderId(e.target.value)}
+                       className="w-full bg-slate-900 text-xs font-bold text-slate-300 border border-slate-800 rounded-xl p-2.5 outline-none focus:border-[#00F0FF] transition-all"
+                     >
+                        {providers.map(p => (
+                          <option key={p.id} value={p.id}>{p.name} ({p.costPerMinute}/m)</option>
+                        ))}
+                     </select>
+                  </div>
+
+                  {/* Dial Pad Grid */}
+                  <div className="grid grid-cols-3 gap-2.5">
+                     {['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'].map(key => (
+                       <button 
+                         key={key}
+                         onClick={() => {
+                           setPhoneNumber(prev => prev + key);
+                           playDTMFTone(key);
+                         }}
+                         className="h-12 bg-slate-900 hover:bg-slate-800 border border-slate-800/50 hover:border-slate-700/50 text-white font-mono font-black rounded-2xl text-base transition-all active:scale-95 flex items-center justify-center shadow-sm"
+                       >
+                         {key}
+                       </button>
+                     ))}
+                  </div>
+
+                  {/* Call Trigger button */}
+                  <button 
+                    onClick={() => handleDial()}
+                    disabled={!phoneNumber}
+                    className="w-full py-4 bg-green-500 hover:bg-green-400 disabled:opacity-50 disabled:cursor-not-allowed text-black rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-lg flex items-center justify-center gap-2"
+                  >
+                     <Phone className="w-4 h-4" /> Iniciar Llamada
+                  </button>
+               </div>
+             )}
+
+             {softphoneStatus !== 'idle' && (
+               <div className="p-5 space-y-6">
+                  {/* ZohoPhone / Iframe Webphone simulation */}
+                  {providers.find(p => p.id === selectedProviderId)?.type === 'iframe' && (
+                     <div className="p-3 bg-slate-900 border border-slate-800 rounded-2xl flex flex-col items-center justify-center text-center space-y-1.5 relative overflow-hidden">
+                        <div className="absolute top-1.5 right-1.5 flex items-center gap-1">
+                           <span className="h-1.5 w-1.5 rounded-full bg-[#00F0FF] animate-pulse" />
+                           <span className="text-[6px] font-mono font-bold text-[#00F0FF]">IFRAME WEBRTC DEVICE</span>
+                        </div>
+                        <div className="w-full flex justify-between text-[7px] text-slate-500 font-mono">
+                           <span>Status: connected</span>
+                           <span>TLS 1.3 Active</span>
+                        </div>
+                        <div className="h-10 w-full bg-slate-950 rounded-lg flex items-center justify-around border border-slate-800/60 p-1">
+                           <span className="text-[7px] text-slate-400 font-mono">Input Level</span>
+                           <div className="h-2 w-16 bg-slate-800 rounded relative overflow-hidden">
+                              <motion.div 
+                                animate={{ width: ['15%', '85%', '35%', '90%', '25%'] }}
+                                transition={{ repeat: Infinity, duration: 1 }}
+                                className="h-full bg-green-500" 
+                              />
+                           </div>
+                        </div>
+                        <p className="text-[7px] text-[#00F0FF] tracking-wider uppercase font-mono leading-tight">Canal de Voz enlazado vía Zoho Phone WebRTC SDK</p>
+                     </div>
+                  )}
+
+                  {/* Audio controls */}
+                  <div className="grid grid-cols-3 gap-3">
+                     <button 
+                       onClick={() => {
+                         setIsMuted(!isMuted);
+                         addSipLog(isMuted ? "SIP/2.0 Audio stream UNMUTED" : "SIP/2.0 Audio stream MUTED");
+                       }}
+                       className={`h-14 rounded-2xl flex flex-col items-center justify-center gap-1 border transition-all ${
+                         isMuted ? 'bg-red-500/10 border-red-500 text-red-500' : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                       }`}
+                     >
+                        <Mic className="w-4 h-4" />
+                        <span className="text-[7px] font-black uppercase tracking-widest">Silencio</span>
+                     </button>
+                     <button 
+                       onClick={() => {
+                         setIsSpeaker(!isSpeaker);
+                         addSipLog(isSpeaker ? "Audio output routed to Headset" : "Audio output routed to Speakerphone (Boosted gain)");
+                       }}
+                       className={`h-14 rounded-2xl flex flex-col items-center justify-center gap-1 border transition-all ${
+                         isSpeaker ? 'bg-blue-500/10 border-[#00F0FF] text-[#00F0FF]' : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                       }`}
+                     >
+                        <Activity className="w-4 h-4" />
+                        <span className="text-[7px] font-black uppercase tracking-widest">Altavoz</span>
+                     </button>
+                     <button 
+                       onClick={() => {
+                         setIsRecording(!isRecording);
+                         addSipLog(isRecording ? "NLP RECORDER STOPPED" : "NLP RECORDER ACTIVE - Real-time NLP stream transcription triggered");
+                       }}
+                       className={`h-14 rounded-2xl flex flex-col items-center justify-center gap-1 border transition-all ${
+                         isRecording ? 'bg-red-500/10 border-red-500 text-red-500 animate-pulse' : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                       }`}
+                     >
+                        <span className="relative flex h-2 w-2">
+                          <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500 animate-ping"></span>
+                        </span>
+                        <span className="text-[7px] font-black uppercase tracking-widest">Grabar</span>
+                     </button>
+                  </div>
+
+                  {/* End call button */}
+                  <button 
+                    onClick={handleHangUp}
+                    className="w-full py-4 bg-red-600 hover:bg-red-500 text-white rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-lg flex items-center justify-center gap-2"
+                  >
+                     <X className="w-4 h-4" /> Terminar Llamada
+                  </button>
+               </div>
+             )}
+
+             {/* Collapsible SIP Console Log */}
+             <div className="border-t border-slate-900 bg-slate-950/40">
+                <button 
+                  onClick={() => setShowSipConsole(!showSipConsole)}
+                  className="w-full px-5 py-2.5 flex items-center justify-between text-[8px] font-black uppercase tracking-widest text-slate-500 hover:text-slate-300 hover:bg-slate-900/10 transition-all border-none outline-none"
+                >
+                   <span className="flex items-center gap-1.5">
+                      <Terminal className="w-3.5 h-3.5 text-[#00F0FF]" /> Consola de Registro SIP / WebRTC
+                   </span>
+                   <span className="font-mono text-[9px]">{showSipConsole ? '[-]' : '[+]'}</span>
+                </button>
+                {showSipConsole && (
+                   <div className="px-5 pb-5 max-h-32 overflow-y-auto font-mono text-[7px] text-green-400 bg-slate-950/80 p-3 space-y-1 border-t border-slate-900/50">
+                      {sipLogs.length === 0 ? (
+                         <p className="text-slate-600 italic">Esperando inicialización de canal...</p>
+                      ) : (
+                         sipLogs.map((log, index) => (
+                            <p key={index} className="leading-relaxed whitespace-pre-wrap">{log}</p>
+                         ))
+                      )}
+                   </div>
+                )}
+             </div>
+
+             {/* Call History section in Softphone */}
+             {softphoneStatus === 'idle' && (
+               <div className="p-5 pt-0 border-t border-slate-900">
+                  <p className="text-[8px] font-black text-slate-500 uppercase tracking-widest my-3">Historial Reciente</p>
+                  <div className="space-y-2 max-h-32 overflow-y-auto custom-scrollbar">
+                     {callHistory.map(hist => (
+                       <div 
+                         key={hist.id} 
+                         onClick={() => setPhoneNumber(hist.number)}
+                         className="p-2 hover:bg-white/5 rounded-xl flex items-center justify-between cursor-pointer group/hist transition-all border border-transparent hover:border-slate-800"
+                       >
+                          <div className="flex items-center gap-2">
+                             <PhoneOutgoing className={`w-3 h-3 ${hist.status === 'completed' ? 'text-green-500' : 'text-red-500'}`} />
+                             <div>
+                                <p className="text-[10px] font-black text-slate-200 group-hover/hist:text-[#00F0FF] transition-colors">{hist.number}</p>
+                                <p className="text-[7px] font-bold text-slate-500 uppercase">{hist.timestamp}</p>
+                             </div>
+                          </div>
+                          <span className="text-[8px] font-mono text-slate-400 font-bold">{hist.duration}</span>
+                       </div>
+                     ))}
+                  </div>
+               </div>
+             )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Modal de Supervisión e Intervención de Llamadas */}
+      <CallInterventionModal 
+        isOpen={isInterventionModalOpen}
+        onClose={() => setIsInterventionModalOpen(false)}
+        activeCall={activeCall || { customer: 'Cliente', agent: 'Marta García' }}
+        onIntervene={(mode) => {
+          if (mode === 'hangup') {
+            setSupervisionMode(null);
+            handleHangUp();
+          } else {
+            setSupervisionMode(mode);
+            addSipLog(`[SUPERVISOR] MODO ${mode.toUpperCase()} ACTIVADO`);
+          }
+        }}
+      />
+
+      {/* Modal de Registro de Disposición de Llamada (TLMK) */}
+      <CallDispositionModal
+        isOpen={isDispositionModalOpen}
+        onClose={() => {
+          setIsDispositionModalOpen(false);
+          setDispositionCallData(null);
+        }}
+        onSaveDisposition={handleSaveDisposition}
+        contactName={dispositionCallData?.name || 'Cliente'}
+        contactNumber={dispositionCallData?.number || 'Número'}
+      />
+    </div>
+  );
+}
